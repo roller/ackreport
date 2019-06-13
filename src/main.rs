@@ -88,17 +88,17 @@ impl ReportItem {
                     hostname: peer.hostname,
                     ip: Some(peer_addr.ip())
                 },
-                port: port,
-                result: result
+                port,
+                result
             },
             _  => ReportItem {
                 local: HostLookup {
                     hostname: local.hostname,
                     ip: None
                 },
-                peer: peer,
-                port: port,
-                result: result
+                peer,
+                port,
+                result
             }
         }
     }
@@ -114,7 +114,7 @@ impl ReportItem {
                 hostname: peer_hostname.to_string(),
                 ip: None
             },
-            port: port,
+            port,
             result: ConnectResult::UnknownError(err)
         }
     }
@@ -182,11 +182,13 @@ fn parse_dest_args(matches: &clap::ArgMatches) -> Vec<HostsPorts> {
     let mut dest_args = dest_matches.iter();
     let mut dests: Vec<HostsPorts> = vec![];
     loop {
-        let dest_hosts = dest_args.take_while_ref(|s| !s.starts_with(":")).map(|s| s.clone()).collect_vec();
+        let dest_hosts = dest_args
+            .take_while_ref(|s| !s.starts_with(':'))
+            .cloned().collect_vec();
         if dest_hosts.is_empty() { break; }
-        let mut dest_ports = dest_args.take_while_ref(|s|  s.starts_with(":"))
+        let mut dest_ports = dest_args.take_while_ref(|s|  s.starts_with(':'))
             .map(|s| -> Option<u16> {
-                let s1 = s.trim_left_matches(':');
+                let s1 = s.trim_start_matches(':');
                 let parsed = s1.parse::<u16>();
                 match parsed {
                     Ok(x) => Some(x),
@@ -201,7 +203,7 @@ fn parse_dest_args(matches: &clap::ArgMatches) -> Vec<HostsPorts> {
             .collect_vec();
         if dest_ports.is_empty() {
             // default ports
-            dest_ports.extend([ 80, 443 ].into_iter());
+            dest_ports.extend([ 80, 443 ].iter());
         }
         dests.push(HostsPorts { hostnames: dest_hosts, ports: dest_ports });
     }
@@ -228,11 +230,11 @@ fn report_host_port<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem
 }
 
 fn report_host<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem>, local_host_lookup: &HostLookup,
-    host: &str, lookup_port: u16, ports: &Vec<u16>) -> Result<(), io::Error>
+    host: &str, lookup_port: u16, ports: &[u16]) -> Result<(), io::Error>
 {
 
-    let socket_addrs = (host.as_ref(), lookup_port).to_socket_addrs()?;
-    for s in socket_addrs.into_iter() {
+    let socket_addrs = (host, lookup_port).to_socket_addrs()?;
+    for s in socket_addrs {
         let peer_info = HostLookup {
             hostname: host.to_string(),
             ip: Some(s.ip())
