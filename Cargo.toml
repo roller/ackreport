@@ -2,12 +2,13 @@
 name = "ackreport"
 version = "0.1.0"
 authors = ["roller"]
+edition = "2018"
 
 [dependencies]
 clap = "~2.32.0"
 get_if_addrs = "0.5.3"
 hostname = "^0.1"
-log = "0.4.0"
+log = "0.4"
 env_logger = "0.5.11"
 itertools = "0.7.8"
 tabwriter = "1.1.0"

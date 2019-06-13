@@ -1,18 +1,16 @@
 use std::io;
-use io::Write;
+use crate::io::Write;
 use std::net;
 use std::net::ToSocketAddrs;
 use std::time;
-// use std::str::FromStr;
-extern crate clap;
-extern crate get_if_addrs;
-extern crate hostname;
-#[macro_use]
-extern crate log;
-extern crate env_logger;
-extern crate itertools;
+use clap;
+use get_if_addrs;
+use hostname;
+use log::{log,error,debug};
+use env_logger;
+
 use itertools::Itertools;
-extern crate tabwriter;
+
 use tabwriter::TabWriter;
 
 #[derive(Clone, Debug)]
@@ -22,7 +20,7 @@ struct HostLookup {
 }
 
 impl std::fmt::Display for HostLookup {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.ip {
             Some(ip) => write!(f, "{} {}", self.hostname, ip),
             None => write!(f, "{}", self.hostname)
@@ -49,7 +47,7 @@ enum ConnectResult {
 }
 
 impl std::fmt::Display for ConnectResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectResult::Open {..} => write!(f, "Open"),
             ConnectResult::Closed => write!(f, "Closed"),
@@ -177,7 +175,7 @@ fn to_connect_result(result: io::Result<net::TcpStream>) -> ConnectResult {
 
 // group args host1 host2 :22 host3 :33 :44 :55
 // into [{[host1, host2], [22]}, {[host3], [33, 44, 55]}]
-fn parse_dest_args(matches: &clap::ArgMatches) -> Vec<HostsPorts> {
+fn parse_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPorts> {
     let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(|| vec![]);
     let mut dest_args = dest_matches.iter();
     let mut dests: Vec<HostsPorts> = vec![];
@@ -214,7 +212,8 @@ fn report_host_port<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem
      peer_info: &HostLookup,  sock_addr: &net::SocketAddr, port: u16) -> Result<(), io::Error>
 {
 
-    for s in (sock_addr.ip(), port).to_socket_addrs()? {
+    let socket_addrs = (sock_addr.ip(), port).to_socket_addrs()?;
+    for s in socket_addrs {
         let t = net::TcpStream::connect_timeout(&s, time::Duration::from_millis(3000));
         debug!("addr {:?} to stream {:?}", s, t);
         let item = ReportItem::from_connect_result(
