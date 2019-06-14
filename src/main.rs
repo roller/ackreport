@@ -211,7 +211,6 @@ fn parse_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPorts> {
 fn report_host_port<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem>, local_host_lookup: &HostLookup,
      peer_info: &HostLookup,  sock_addr: &net::SocketAddr, port: u16) -> Result<(), io::Error>
 {
-
     let socket_addrs = (sock_addr.ip(), port).to_socket_addrs()?;
     for s in socket_addrs {
         let t = net::TcpStream::connect_timeout(&s, time::Duration::from_millis(3000));
@@ -231,7 +230,6 @@ fn report_host_port<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem
 fn report_host<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem>, local_host_lookup: &HostLookup,
     host: &str, lookup_port: u16, ports: &[u16]) -> Result<(), io::Error>
 {
-
     let socket_addrs = (host, lookup_port).to_socket_addrs()?;
     for s in socket_addrs {
         let peer_info = HostLookup {
@@ -260,6 +258,33 @@ fn report_hosts_ports<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportIt
     }
 }
 
+fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
+    let mut host_name_ip = vec![];
+    match get_if_addrs::get_if_addrs() {
+        Ok(interfaces) => {
+            host_name_ip.extend(
+                interfaces.into_iter()
+                    .map(|i| {
+                        debug!("interface {:?}", i);
+                        i
+                    })
+                    .filter(|i| !i.is_loopback() && i.has_broadcast())
+                    .map(|i| HostLookup {
+                        hostname: src_hostname.into(),
+                        ip: Some(i.ip()),
+                    })
+            );
+        }
+        Err(err) => {
+            error!("Couldn't get local interfaces: {}", err);
+        }
+    }
+    writeln!(&mut tw, "Local Interfaces").unwrap();
+    for i in &host_name_ip {
+        writeln!(&mut tw, "{}", i).unwrap();
+    }
+}
+
 fn main() {
     env_logger::init();
     let appmatches = clap::App::new("ackreport")
@@ -278,7 +303,6 @@ fn main() {
         .get_matches();
     let dests = parse_dest_args(&appmatches);
 
-
     let src_hostname = match hostname::get_hostname() {
         Some(hostname) => hostname,
         None => {
@@ -289,31 +313,7 @@ fn main() {
     let mut tw = TabWriter::new(io::stdout());
 
     if appmatches.is_present("interfaces") {
-        let mut host_name_ip = vec![];
-        match get_if_addrs::get_if_addrs() {
-            Ok(interfaces) => {
-                host_name_ip.extend(
-                    interfaces.into_iter()
-                        .map(|i| {
-                            debug!("interface {:?}", i);
-                            i
-                        })
-                        // .filter(|i| !i.is_loopback() && i.has_broadcast())
-                        .filter(|i| !i.is_loopback() && i.has_broadcast())
-                        .map(|i| HostLookup {
-                            hostname: src_hostname.clone(),
-                            ip:Some( i.ip()),
-                        })
-                );
-            }
-            Err(err) => {
-                error!("Couldn't get local interfaces: {}", err);
-            }
-        }
-        writeln!(&mut tw, "Local Interfaces").unwrap();
-        for i in &host_name_ip {
-            writeln!(&mut tw, "{}", i).unwrap();
-        }
+        report_interfaces(&mut tw, &src_hostname)
     }
 
     let local_host_fallback = HostLookup {
@@ -330,3 +330,4 @@ fn main() {
         error!("Couldn't flush tab writer: {}", e);
     }
 }
+
