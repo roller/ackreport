@@ -13,6 +13,14 @@ use itertools::Itertools;
 
 use tabwriter::TabWriter;
 
+// Group of hosts and ports to attempt connections
+#[derive(Debug)]
+struct HostsPorts {
+    hostnames: Vec<String>,
+    ports: Vec<u16>
+}
+
+// Hostnames and results of an DNS/host lookup
 #[derive(Clone, Debug)]
 struct HostLookup {
     hostname: String,
@@ -29,13 +37,6 @@ impl std::fmt::Display for HostLookup {
 }
 
 #[derive(Debug)]
-struct HostsPorts {
-    hostnames: Vec<String>,
-    ports: Vec<u16>
-}
-
-// results we actually care about
-#[derive(Debug)]
 enum ConnectResult {
     Open {
         local: net::SocketAddr, 
@@ -43,7 +44,29 @@ enum ConnectResult {
     },
     Closed,
     Filtered,
-    UnknownError(io::Error)
+    OtherIoError(io::Error)
+}
+
+impl From<io::Result<net::TcpStream>> for ConnectResult {
+    fn from(result: io::Result<net::TcpStream>) -> ConnectResult {
+        match result {
+            Ok(stream) => {
+                let local = stream.local_addr();
+                let peer = stream.peer_addr();
+                ConnectResult::Open {
+                    local: local.expect("TCP stream should have local IP"),
+                    peer: peer.expect("TCP stream should have peer IP")
+                }
+            },
+            Err(e) => {
+                match e.kind() {
+                    io::ErrorKind::TimedOut => ConnectResult::Filtered,
+                    io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
+                    _ => ConnectResult::OtherIoError(e)
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ConnectResult {
@@ -52,7 +75,7 @@ impl std::fmt::Display for ConnectResult {
             ConnectResult::Open {..} => write!(f, "Open"),
             ConnectResult::Closed => write!(f, "Closed"),
             ConnectResult::Filtered => write!(f, "Filtered"),
-            ConnectResult::UnknownError(e) => write!(f, "Error: {}", e)
+            ConnectResult::OtherIoError(e) => write!(f, "Error: {}", e)
         }
     }
 }
@@ -78,30 +101,19 @@ impl ReportItem {
                 local: local_addr,
                 peer: peer_addr
             } => ReportItem {
-                local: HostLookup {
-                    hostname: local.hostname,
-                    ip: Some(local_addr.ip())
-                },
-                peer: HostLookup {
-                    hostname: peer.hostname,
-                    ip: Some(peer_addr.ip())
-                },
-                port,
-                result
+                local: HostLookup { hostname: local.hostname, ip: Some(local_addr.ip()) },
+                peer: HostLookup { hostname: peer.hostname, ip: Some(peer_addr.ip()) },
+                port, result
             },
             _  => ReportItem {
-                local: HostLookup {
-                    hostname: local.hostname,
-                    ip: None
-                },
-                peer,
-                port,
-                result
+                local: HostLookup { hostname: local.hostname, ip: None },
+                peer, port, result
             }
         }
     }
 
-    fn from_lookup_error(
+    // especially for errors during host lookup
+    fn from_io_error(
         local_host_lookup: HostLookup,
         peer_hostname: &str,
         port: u16,
@@ -113,19 +125,17 @@ impl ReportItem {
                 ip: None
             },
             port,
-            result: ConnectResult::UnknownError(err)
+            result: ConnectResult::OtherIoError(err)
         }
     }
-    
-}
 
-impl ReportItem {
     fn header<W: Write>(tw: &mut TabWriter<W>) {
         let r = writeln!(tw, "Local\tPeer\tPort\tResult");
         if let Err(e) = r {
             error!("Error writing header: {}", e);
         }
     }
+
     fn println<W: Write>(&self, tw: &mut TabWriter<W>) {
         let r = writeln!(tw, "{}\t{}\t:{}\t{}",
             self.local, self.peer, self.port, self.result);
@@ -153,29 +163,10 @@ impl HasBroadcast for get_if_addrs::Interface {
     }
 }
 
-fn to_connect_result(result: io::Result<net::TcpStream>) -> ConnectResult {
-    match result {
-        Ok(stream) => {
-            let local = stream.local_addr();
-            let peer = stream.peer_addr();
-            ConnectResult::Open {
-                local: local.expect("TCP stream should have local IP"), 
-                peer: peer.expect("TCP stream should have peer IP")
-            }
-        },
-        Err(e) => {
-            match e.kind() {
-                io::ErrorKind::TimedOut => ConnectResult::Filtered,
-                io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
-                _ => ConnectResult::UnknownError(e)
-            }
-        }
-    }
-}
 
 // group args host1 host2 :22 host3 :33 :44 :55
 // into [{[host1, host2], [22]}, {[host3], [33, 44, 55]}]
-fn parse_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPorts> {
+fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPorts> {
     let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(|| vec![]);
     let mut dest_args = dest_matches.iter();
     let mut dests: Vec<HostsPorts> = vec![];
@@ -208,52 +199,68 @@ fn parse_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPorts> {
     dests
 }
 
-fn report_host_port<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem>, local_host_lookup: &HostLookup,
-     peer_info: &HostLookup,  sock_addr: &net::SocketAddr, port: u16) -> Result<(), io::Error>
+fn report_host_port(local_host_lookup: &HostLookup,
+     peer_info: &HostLookup,  sock_addr: &net::SocketAddr, port: u16) -> Result<Vec<ReportItem>, io::Error>
 {
     let socket_addrs = (sock_addr.ip(), port).to_socket_addrs()?;
-    for s in socket_addrs {
+    let report = socket_addrs.map(|s| {
         let t = net::TcpStream::connect_timeout(&s, time::Duration::from_millis(3000));
-        debug!("addr {:?} to stream {:?}", s, t);
-        let item = ReportItem::from_connect_result(
+        debug!("tcp connect addr {:?} returned {:?}", s, t);
+        ReportItem::from_connect_result(
             local_host_lookup.clone(),
             peer_info.clone(),
             port,
-            to_connect_result(t)
-        );
-        item.println(tw);
-        report.push(item);
-    }
-    Ok(())
+            t.into()
+        )
+    }).collect();
+    Ok(report)
 }
 
-fn report_host<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem>, local_host_lookup: &HostLookup,
-    host: &str, lookup_port: u16, ports: &[u16]) -> Result<(), io::Error>
+fn report_host(local_host_lookup: &HostLookup,
+    host: &str, lookup_port: u16, ports: &[u16]) -> Result<Vec<ReportItem>,io::Error>
 {
     let socket_addrs = (host, lookup_port).to_socket_addrs()?;
-    for s in socket_addrs {
+    let host_report: Vec<_> = socket_addrs.map(|s|{
         let peer_info = HostLookup {
             hostname: host.to_string(),
             ip: Some(s.ip())
         };
-        for port in ports {
-            report_host_port(tw, report, local_host_lookup, &peer_info, &s, *port)?;
-        }
-    }
-    Ok(())
+
+        let socket_addr_report: Vec<ReportItem> = ports.iter().map(|port| {
+            report_host_port(local_host_lookup, &peer_info, &s, *port)
+                .unwrap_or_else(|err| vec![
+                    ReportItem::from_io_error(
+                        local_host_lookup.clone(),
+                         &peer_info.hostname,
+                        *port, err)
+                    ])
+        }).flatten().collect();
+        socket_addr_report
+    }).flatten().collect();
+    Ok(host_report)
 }
 
-fn report_hosts_ports<W: Write>(tw: &mut TabWriter<W>, report: &mut Vec<ReportItem>, local_host_lookup: &HostLookup, hosts_ports: &HostsPorts) {
+fn report_hosts_ports(local_host_lookup: &HostLookup, hosts_ports: &HostsPorts)
+    -> Vec<ReportItem> {
     // assume that any port will result in the same lookup,
     // so use the first port just to find the dest ip
     let lookup_port = hosts_ports.ports.get(0).map_or(443, |p| *p);
-    for host in &hosts_ports.hostnames {
-        if let Err(err) = report_host(tw, report, local_host_lookup, host, lookup_port, &hosts_ports.ports) {
-            let item = ReportItem::from_lookup_error(
+    hosts_ports.hostnames.iter().map(|host| {
+        report_host(local_host_lookup, host, lookup_port, &hosts_ports.ports)
+            .unwrap_or_else(|err| vec![
+                ReportItem::from_io_error(
                 local_host_lookup.clone(),
-                &host, lookup_port, err);
-            item.println(tw);
-            report.push(item);
+                &host, lookup_port, err)
+            ])
+    }).flatten().collect()
+}
+
+fn get_hostname() -> String {
+    match hostname::get_hostname() {
+        Some(hostname) => hostname,
+        None => {
+            error!("Couldn't get hostname, using localhost");
+            "localhost".into()
         }
     }
 }
@@ -283,6 +290,9 @@ fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
     for i in &host_name_ip {
         writeln!(&mut tw, "{}", i).unwrap();
     }
+    if let Err(e) = tw.flush() {
+        error!("Couldn't flush tab writer: {}", e);
+    }
 }
 
 fn main() {
@@ -290,7 +300,6 @@ fn main() {
     let appmatches = clap::App::new("ackreport")
         .version("0.0")
         .author("Joel Roller <roller@gmail.com>")
-        .about("Let me syn ack you something.")
         .arg(clap::Arg::with_name("dest")
              .help("Destination hostnames and :ports")
              .multiple(true)
@@ -301,15 +310,9 @@ fn main() {
             .long("interfaces")
             .takes_value(false))
         .get_matches();
-    let dests = parse_dest_args(&appmatches);
 
-    let src_hostname = match hostname::get_hostname() {
-        Some(hostname) => hostname,
-        None => {
-            error!("Couldn't get hostname, using localhost");
-            "localhost".into()
-        }
-    };
+    let dests = group_dest_args(&appmatches);
+    let src_hostname = get_hostname();
     let mut tw = TabWriter::new(io::stdout());
 
     if appmatches.is_present("interfaces") {
@@ -321,11 +324,15 @@ fn main() {
         ip: None
     };
 
-    let mut report: Vec<ReportItem> = vec![];
+    let report = dests.iter().map(
+        |x| report_hosts_ports(&local_host_fallback, &x)
+    ).flatten();
+
     ReportItem::header(&mut tw);
-    for hosts_ports in dests {
-        report_hosts_ports(&mut tw, &mut report, &local_host_fallback, &hosts_ports);
+    for item in report {
+        item.println(&mut tw);
     }
+
     if let Err(e) = tw.flush() {
         error!("Couldn't flush tab writer: {}", e);
     }
