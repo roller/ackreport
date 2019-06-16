@@ -353,11 +353,12 @@ fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
 
 fn main() {
     env_logger::init();
+    const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
+
     let appmatches = clap::App::new("ackreport")
-        .version("0.0")
-        .author("Joel Roller <roller@gmail.com>")
+        .version(VERSION.unwrap_or("v0"))
         .arg(clap::Arg::with_name("threads")
-            .help("Number of parallel connections to attempt (default 10)")
+            .help("Parallel connection attempts (default 10)")
             .multiple(false)
             .long("threads")
             .required(false)
