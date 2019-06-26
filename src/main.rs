@@ -1,15 +1,15 @@
-use std::io;
 use crate::io::Write;
-use std::net;
-use std::env;
-use std::net::{ToSocketAddrs, SocketAddr};
-use std::time;
 use clap;
+use env_logger;
 use get_if_addrs;
 use hostname;
-use log::{log,error,debug};
-use env_logger;
+use log::{debug, error, log};
 use rayon::prelude::*;
+use std::env;
+use std::io;
+use std::net;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::time;
 
 use itertools::Itertools;
 
@@ -19,21 +19,21 @@ use tabwriter::TabWriter;
 #[derive(Debug)]
 struct HostsPortsGroup {
     hostnames: Vec<String>,
-    ports: Vec<u16>
+    ports: Vec<u16>,
 }
 
 // Hostnames and results of an DNS/host lookup
 #[derive(Clone, Debug)]
 struct HostLookup {
     hostname: String,
-    ip: Option<net::IpAddr>
+    ip: Option<net::IpAddr>,
 }
 
 impl std::fmt::Display for HostLookup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.ip {
             Some(ip) => write!(f, "{} {}", self.hostname, ip),
-            None => write!(f, "{}", self.hostname)
+            None => write!(f, "{}", self.hostname),
         }
     }
 }
@@ -41,13 +41,13 @@ impl std::fmt::Display for HostLookup {
 #[derive(Debug)]
 enum ConnectResult {
     Open {
-        local: net::SocketAddr, 
-        peer: net::SocketAddr
+        local: net::SocketAddr,
+        peer: net::SocketAddr,
     },
     Closed,
     Filtered,
     EmptySocketAddrs,
-    OtherIoError(io::Error)
+    OtherIoError(io::Error),
 }
 
 impl From<io::Result<net::TcpStream>> for ConnectResult {
@@ -58,16 +58,14 @@ impl From<io::Result<net::TcpStream>> for ConnectResult {
                 let peer = stream.peer_addr();
                 ConnectResult::Open {
                     local: local.expect("TCP stream should have local IP"),
-                    peer: peer.expect("TCP stream should have peer IP")
-                }
-            },
-            Err(e) => {
-                match e.kind() {
-                    io::ErrorKind::TimedOut => ConnectResult::Filtered,
-                    io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
-                    _ => ConnectResult::OtherIoError(e)
+                    peer: peer.expect("TCP stream should have peer IP"),
                 }
             }
+            Err(e) => match e.kind() {
+                io::ErrorKind::TimedOut => ConnectResult::Filtered,
+                io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
+                _ => ConnectResult::OtherIoError(e),
+            },
         }
     }
 }
@@ -75,11 +73,11 @@ impl From<io::Result<net::TcpStream>> for ConnectResult {
 impl std::fmt::Display for ConnectResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectResult::Open {..} => write!(f, "Open"),
+            ConnectResult::Open { .. } => write!(f, "Open"),
             ConnectResult::Closed => write!(f, "Closed"),
             ConnectResult::Filtered => write!(f, "Filtered"),
             ConnectResult::EmptySocketAddrs => write!(f, "EmptySocketAddrs"),
-            ConnectResult::OtherIoError(e) => write!(f, "Error: {}", e)
+            ConnectResult::OtherIoError(e) => write!(f, "Error: {}", e),
         }
     }
 }
@@ -87,20 +85,17 @@ impl std::fmt::Display for ConnectResult {
 #[derive(Debug)]
 enum ReportItem {
     Todo(ReportTodo),
-    Done(ReportDone)
+    Done(ReportDone),
 }
 
 impl ReportItem {
-    fn from_sock(pair: ReportPair, sock: SocketAddr) -> ReportItem
-    {
+    fn from_sock(pair: ReportPair, sock: SocketAddr) -> ReportItem {
         ReportItem::Todo(ReportTodo { pair, sock })
     }
-    fn from_connect_result(pair: ReportPair, result: ConnectResult) -> ReportItem
-    {
+    fn from_connect_result(pair: ReportPair, result: ConnectResult) -> ReportItem {
         ReportItem::Done(ReportDone::from_connect_result(pair, result))
     }
-    fn from_io_error(pair: ReportPair, err: io::Error) -> ReportItem
-    {
+    fn from_io_error(pair: ReportPair, err: io::Error) -> ReportItem {
         ReportItem::Done(ReportDone::from_io_error(pair, err))
     }
 }
@@ -109,7 +104,7 @@ impl From<ReportItem> for ReportDone {
     fn from(item: ReportItem) -> ReportDone {
         match item {
             ReportItem::Done(done) => done,
-            ReportItem::Todo(todo) => todo.check_connect()
+            ReportItem::Todo(todo) => todo.check_connect(),
         }
     }
 }
@@ -125,50 +120,54 @@ struct ReportPair {
 
 struct ReportTodo {
     pair: ReportPair,
-    sock: SocketAddr
+    sock: SocketAddr,
 }
 
 impl ReportTodo {
     fn check_connect(self: ReportTodo) -> ReportDone {
-        let t = net::TcpStream::connect_timeout( &self.sock, time::Duration::from_millis(3000));
+        let t = net::TcpStream::connect_timeout(&self.sock, time::Duration::from_millis(3000));
         debug!("tcp connect addr {:?} returned {:?}", self.sock, t);
-        ReportDone::from_connect_result( self.pair, t.into())
+        ReportDone::from_connect_result(self.pair, t.into())
     }
 }
 
 #[derive(Debug)]
 struct ReportDone {
     pair: ReportPair,
-    result: ConnectResult
+    result: ConnectResult,
 }
 
 impl ReportDone {
-    fn from_connect_result(
-        pair: ReportPair,
-        result: ConnectResult) -> ReportDone {
+    fn from_connect_result(pair: ReportPair, result: ConnectResult) -> ReportDone {
         match result {
             // for open connections, replace initial guesses
             // with actual ips used
             ConnectResult::Open {
                 local: local_addr,
-                peer: peer_addr
+                peer: peer_addr,
             } => ReportDone {
                 pair: ReportPair {
-                    local: HostLookup { hostname: pair.local.hostname, ip: Some(local_addr.ip()) },
-                    peer: HostLookup { hostname: pair.peer.hostname, ip: Some(peer_addr.ip()) },
-                    port: pair.port
+                    local: HostLookup {
+                        hostname: pair.local.hostname,
+                        ip: Some(local_addr.ip()),
+                    },
+                    peer: HostLookup {
+                        hostname: pair.peer.hostname,
+                        ip: Some(peer_addr.ip()),
+                    },
+                    port: pair.port,
                 },
-                result
+                result,
             },
-            _  => ReportDone { pair, result }
+            _ => ReportDone { pair, result },
         }
     }
 
     // especially for errors during host lookup
-    fn from_io_error( pair: ReportPair, err: io::Error) -> ReportDone {
+    fn from_io_error(pair: ReportPair, err: io::Error) -> ReportDone {
         ReportDone {
             pair,
-            result: ConnectResult::OtherIoError(err)
+            result: ConnectResult::OtherIoError(err),
         }
     }
 
@@ -180,8 +179,11 @@ impl ReportDone {
     }
 
     fn println<W: Write>(&self, tw: &mut TabWriter<W>) {
-        let r = writeln!(tw, "{}\t{}\t:{}\t{}",
-            self.pair.local, self.pair.peer, self.pair.port, self.result);
+        let r = writeln!(
+            tw,
+            "{}\t{}\t:{}\t{}",
+            self.pair.local, self.pair.peer, self.pair.port, self.result
+        );
         if let Err(e) = r {
             error!("Error writing report item: {}", e);
         }
@@ -196,7 +198,7 @@ impl HasBroadcast for get_if_addrs::IfAddr {
     fn has_broadcast(&self) -> bool {
         match self {
             get_if_addrs::IfAddr::V4(i) => i.broadcast.is_some(),
-            get_if_addrs::IfAddr::V6(i) => i.broadcast.is_some()
+            get_if_addrs::IfAddr::V6(i) => i.broadcast.is_some(),
         }
     }
 }
@@ -215,9 +217,13 @@ fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
     loop {
         let dest_hosts = dest_args
             .take_while_ref(|s| !s.starts_with(':'))
-            .cloned().collect_vec();
-        if dest_hosts.is_empty() { break; }
-        let mut dest_ports = dest_args.take_while_ref(|s|  s.starts_with(':'))
+            .cloned()
+            .collect_vec();
+        if dest_hosts.is_empty() {
+            break;
+        }
+        let mut dest_ports = dest_args
+            .take_while_ref(|s| s.starts_with(':'))
             .flat_map(|s| -> Option<u16> {
                 let s1 = s.trim_start_matches(':');
                 let parsed = s1.parse::<u16>();
@@ -232,74 +238,103 @@ fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
             .collect_vec();
         if dest_ports.is_empty() {
             // default ports
-            dest_ports.extend([ 80, 443 ].iter());
+            dest_ports.extend([80, 443].iter());
         }
-        dests.push(HostsPortsGroup { hostnames: dest_hosts, ports: dest_ports });
+        dests.push(HostsPortsGroup {
+            hostnames: dest_hosts,
+            ports: dest_ports,
+        });
     }
     dests
 }
 
-fn report_host_port( pair: ReportPair, sock_addr: net::SocketAddr )
-    -> Result<Vec<ReportItem>, io::Error>
-{
+fn report_host_port(
+    pair: ReportPair,
+    sock_addr: net::SocketAddr,
+) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (sock_addr.ip(), pair.port).to_socket_addrs()?;
-    let mut report: Vec<ReportItem> = socket_addrs.map(|sock| {
-        ReportItem::from_sock(pair.clone(), sock)
-    }).collect();
+    let mut report: Vec<ReportItem> = socket_addrs
+        .map(|sock| ReportItem::from_sock(pair.clone(), sock))
+        .collect();
     if report.is_empty() {
         // should never happen, but if it does, report it
         report.push(ReportItem::from_connect_result(
-            pair, ConnectResult::EmptySocketAddrs
+            pair,
+            ConnectResult::EmptySocketAddrs,
         ))
     }
     Ok(report)
 }
 
-fn report_host(local_host_lookup: &HostLookup,
-    host: &str, lookup_port: u16, ports: &[u16]) -> Result<Vec<ReportItem>,io::Error>
-{
+fn report_host(
+    local_host_lookup: &HostLookup,
+    host: &str,
+    lookup_port: u16,
+    ports: &[u16],
+) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (host, lookup_port).to_socket_addrs()?;
-    let host_report: Vec<_> = socket_addrs.map(|s|{
-        let peer_info = HostLookup {
-            hostname: host.to_string(),
-            ip: Some(s.ip())
-        };
+    let host_report: Vec<_> = socket_addrs
+        .map(|s| {
+            let peer_info = HostLookup {
+                hostname: host.to_string(),
+                ip: Some(s.ip()),
+            };
 
-        let socket_addr_report: Vec<ReportItem> = ports.iter().map(|port| {
-            report_host_port(ReportPair {
-                local: local_host_lookup.clone(),
-                peer: peer_info.clone(),
-                port: *port
-            }, s)
-                .unwrap_or_else(|err| vec![
-                    ReportItem::from_io_error( ReportPair {
+            let socket_addr_report: Vec<ReportItem> = ports
+                .iter()
+                .map(|port| {
+                    report_host_port(
+                        ReportPair {
                             local: local_host_lookup.clone(),
                             peer: peer_info.clone(),
-                            port: *port
+                            port: *port,
                         },
-                        err)
-                    ])
-        }).flatten().collect();
-        socket_addr_report
-    }).flatten().collect();
+                        s,
+                    )
+                    .unwrap_or_else(|err| {
+                        vec![ReportItem::from_io_error(
+                            ReportPair {
+                                local: local_host_lookup.clone(),
+                                peer: peer_info.clone(),
+                                port: *port,
+                            },
+                            err,
+                        )]
+                    })
+                })
+                .flatten()
+                .collect();
+            socket_addr_report
+        })
+        .flatten()
+        .collect();
     Ok(host_report)
 }
 
-fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup)
-    -> Vec<ReportItem> {
+fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup) -> Vec<ReportItem> {
     // assume that any port will result in the same lookup,
     // so use the first port just to find the dest ip
     let lookup_port = group.ports.get(0).map_or(443, |p| *p);
-    group.hostnames.iter().map(|host| {
-        report_host(local_host_lookup, host, lookup_port, &group.ports)
-            .unwrap_or_else(|err| vec![
-                ReportItem::from_io_error( ReportPair {
-                    local: local_host_lookup.clone(),
-                    peer: HostLookup { hostname: host.to_string(), ip: None },
-                    port: lookup_port
-                }, err)
-            ])
-    }).flatten().collect()
+    group
+        .hostnames
+        .iter()
+        .map(|host| {
+            report_host(local_host_lookup, host, lookup_port, &group.ports).unwrap_or_else(|err| {
+                vec![ReportItem::from_io_error(
+                    ReportPair {
+                        local: local_host_lookup.clone(),
+                        peer: HostLookup {
+                            hostname: host.to_string(),
+                            ip: None,
+                        },
+                        port: lookup_port,
+                    },
+                    err,
+                )]
+            })
+        })
+        .flatten()
+        .collect()
 }
 
 fn get_hostname() -> String {
@@ -317,7 +352,8 @@ fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
     match get_if_addrs::get_if_addrs() {
         Ok(interfaces) => {
             host_name_ip.extend(
-                interfaces.into_iter()
+                interfaces
+                    .into_iter()
                     .map(|i| {
                         debug!("interface {:?}", i);
                         i
@@ -326,7 +362,7 @@ fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
                     .map(|i| HostLookup {
                         hostname: src_hostname.into(),
                         ip: Some(i.ip()),
-                    })
+                    }),
             );
         }
         Err(err) => {
@@ -348,22 +384,28 @@ fn main() {
 
     let appmatches = clap::App::new("ackreport")
         .version(VERSION.unwrap_or("v0"))
-        .arg(clap::Arg::with_name("threads")
-            .help("Parallel connection attempts (default 10)")
-            .multiple(false)
-            .long("threads")
-            .required(false)
-            .takes_value(true)
-            .env("RAYON_NUM_THREADS"))
-        .arg(clap::Arg::with_name("dest")
-             .help("Destination hostnames and :ports")
-             .multiple(true)
-             .required(true))
-        .arg(clap::Arg::with_name("interfaces")
-            .help("Show interfaces")
-            .short("i")
-            .long("interfaces")
-            .takes_value(false))
+        .arg(
+            clap::Arg::with_name("threads")
+                .help("Parallel connection attempts (default 10)")
+                .multiple(false)
+                .long("threads")
+                .required(false)
+                .takes_value(true)
+                .env("RAYON_NUM_THREADS"),
+        )
+        .arg(
+            clap::Arg::with_name("dest")
+                .help("Destination hostnames and :ports")
+                .multiple(true)
+                .required(true),
+        )
+        .arg(
+            clap::Arg::with_name("interfaces")
+                .help("Show interfaces")
+                .short("i")
+                .long("interfaces")
+                .takes_value(false),
+        )
         .get_matches();
 
     let dests = group_dest_args(&appmatches);
@@ -375,18 +417,23 @@ fn main() {
     }
 
     let arg_threads = appmatches.value_of("threads");
-    if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || arg_threads.is_some()  {
-        env::set_var("RAYON_NUM_THREADS", appmatches.value_of("threads").unwrap_or("10"));
+    if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || arg_threads.is_some() {
+        env::set_var(
+            "RAYON_NUM_THREADS",
+            appmatches.value_of("threads").unwrap_or("10"),
+        );
     }
 
     let local_host_fallback = HostLookup {
         hostname: src_hostname.clone(),
-        ip: None
+        ip: None,
     };
 
-    let report_todo: Vec<_> = dests.iter().map(
-        |group| report_hosts_ports(&local_host_fallback, &group)
-    ).flatten().collect();
+    let report_todo: Vec<_> = dests
+        .iter()
+        .map(|group| report_hosts_ports(&local_host_fallback, &group))
+        .flatten()
+        .collect();
 
     let report_done: Vec<_> = report_todo.into_par_iter().map(ReportDone::from).collect();
 
@@ -399,4 +446,3 @@ fn main() {
         error!("Couldn't flush tab writer: {}", e);
     }
 }
-
