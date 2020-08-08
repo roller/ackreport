@@ -1,19 +1,15 @@
-use crate::io::Write;
-use clap;
-use env_logger;
-use get_if_addrs;
-use hostname;
-use log::{debug, error, log};
-use rayon::prelude::*;
 use std::env;
 use std::io;
+use std::io::Write;
 use std::net;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::time;
+use std::time::{Instant, Duration};
 
+use duration_string::DurationString;
 use itertools::Itertools;
-
+use log::{debug, error, log};
 use tabwriter::TabWriter;
+use rayon::prelude::*;
 
 // Group of hosts and ports to attempt connections
 #[derive(Debug)]
@@ -89,14 +85,14 @@ enum ReportItem {
 }
 
 impl ReportItem {
-    fn from_sock(pair: ReportPair, sock: SocketAddr) -> ReportItem {
-        ReportItem::Todo(ReportTodo { pair, sock })
+    fn from_sock(pair: ReportPair, sock: SocketAddr, timeout: Duration) -> ReportItem {
+        ReportItem::Todo(ReportTodo { pair, sock, timeout })
     }
-    fn from_connect_result(pair: ReportPair, result: ConnectResult) -> ReportItem {
-        ReportItem::Done(ReportDone::from_connect_result(pair, result))
+    fn from_connect_result(pair: ReportPair, result: ConnectResult, start: Instant, duration: Duration) -> ReportItem {
+        ReportItem::Done(ReportDone::from_connect_result(pair, result, start, duration))
     }
-    fn from_io_error(pair: ReportPair, err: io::Error) -> ReportItem {
-        ReportItem::Done(ReportDone::from_io_error(pair, err))
+    fn from_io_error(pair: ReportPair, err: io::Error, start: Instant, duration: Duration) -> ReportItem {
+        ReportItem::Done(ReportDone::from_io_error(pair, err, start, duration))
     }
 }
 
@@ -117,17 +113,20 @@ struct ReportPair {
 }
 
 #[derive(Debug)]
-
 struct ReportTodo {
     pair: ReportPair,
     sock: SocketAddr,
+    timeout: Duration
 }
 
 impl ReportTodo {
     fn check_connect(self: ReportTodo) -> ReportDone {
-        let t = net::TcpStream::connect_timeout(&self.sock, time::Duration::from_millis(3000));
-        debug!("tcp connect addr {:?} returned {:?}", self.sock, t);
-        ReportDone::from_connect_result(self.pair, t.into())
+        let start = Instant::now();
+        let t = net::TcpStream::connect_timeout(
+            &self.sock, self.timeout);
+        let duration = Instant::now() - start;
+        debug!("tcp connect addr {:?} returned {:?} in {:?}", self.sock, t, duration);
+        ReportDone::from_connect_result(self.pair, t.into(), start, duration)
     }
 }
 
@@ -135,10 +134,13 @@ impl ReportTodo {
 struct ReportDone {
     pair: ReportPair,
     result: ConnectResult,
+    start: Instant,
+    duration: Duration
 }
 
 impl ReportDone {
-    fn from_connect_result(pair: ReportPair, result: ConnectResult) -> ReportDone {
+    fn from_connect_result(pair: ReportPair, result: ConnectResult,
+                           start: Instant, duration: Duration)-> ReportDone {
         match result {
             // for open connections, replace initial guesses
             // with actual ips used
@@ -158,21 +160,25 @@ impl ReportDone {
                     port: pair.port,
                 },
                 result,
+                start,
+                duration,
             },
-            _ => ReportDone { pair, result },
+            _ => ReportDone { pair, result, start, duration },
         }
     }
 
     // especially for errors during host lookup
-    fn from_io_error(pair: ReportPair, err: io::Error) -> ReportDone {
+    fn from_io_error(pair: ReportPair, err: io::Error, start: Instant, duration: Duration) -> ReportDone {
         ReportDone {
             pair,
             result: ConnectResult::OtherIoError(err),
+            start,
+            duration,
         }
     }
 
     fn header<W: Write>(tw: &mut TabWriter<W>) {
-        let r = writeln!(tw, "Local\tPeer\tPort\tResult");
+        let r = writeln!(tw, "Local\tPeer\tPort\tResult\tTime");
         if let Err(e) = r {
             error!("Error writing header: {}", e);
         }
@@ -181,8 +187,9 @@ impl ReportDone {
     fn println<W: Write>(&self, tw: &mut TabWriter<W>) {
         let r = writeln!(
             tw,
-            "{}\t{}\t:{}\t{}",
-            self.pair.local, self.pair.peer, self.pair.port, self.result
+            "{}\t{}\t:{}\t{}\t{}",
+            self.pair.local, self.pair.peer, self.pair.port, self.result,
+            DurationString::from(self.duration)
         );
         if let Err(e) = r {
             error!("Error writing report item: {}", e);
@@ -211,7 +218,7 @@ impl HasBroadcast for get_if_addrs::Interface {
 // group args host1 host2 :22 host3 :33 :44 :55
 // into [{[host1, host2], [22]}, {[host3], [33, 44, 55]}]
 fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
-    let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(|| vec![]);
+    let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(Vec::new);
     let mut dest_args = dest_matches.iter();
     let mut dests: Vec<HostsPortsGroup> = vec![];
     loop {
@@ -248,19 +255,24 @@ fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
     dests
 }
 
+// Returns a Vec to collect to_socket_addrs, which
+// returns an iterator
 fn report_host_port(
     pair: ReportPair,
     sock_addr: net::SocketAddr,
+    timeout: Duration,
 ) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (sock_addr.ip(), pair.port).to_socket_addrs()?;
     let mut report: Vec<ReportItem> = socket_addrs
-        .map(|sock| ReportItem::from_sock(pair.clone(), sock))
+        .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout))
         .collect();
     if report.is_empty() {
         // should never happen, but if it does, report it
         report.push(ReportItem::from_connect_result(
             pair,
             ConnectResult::EmptySocketAddrs,
+            Instant::now(),
+            Duration::from_millis(0)
         ))
     }
     Ok(report)
@@ -271,6 +283,7 @@ fn report_host(
     host: &str,
     lookup_port: u16,
     ports: &[u16],
+    timeout: Duration,
 ) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (host, lookup_port).to_socket_addrs()?;
     let host_report: Vec<_> = socket_addrs
@@ -290,6 +303,7 @@ fn report_host(
                             port: *port,
                         },
                         s,
+                        timeout,
                     )
                     .unwrap_or_else(|err| {
                         vec![ReportItem::from_io_error(
@@ -299,6 +313,8 @@ fn report_host(
                                 port: *port,
                             },
                             err,
+                            Instant::now(),
+                            Duration::from_millis(0),
                         )]
                     })
                 })
@@ -311,7 +327,7 @@ fn report_host(
     Ok(host_report)
 }
 
-fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup) -> Vec<ReportItem> {
+fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, timeout: Duration) -> Vec<ReportItem> {
     // assume that any port will result in the same lookup,
     // so use the first port just to find the dest ip
     let lookup_port = group.ports.get(0).map_or(443, |p| *p);
@@ -319,7 +335,8 @@ fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup) -
         .hostnames
         .iter()
         .map(|host| {
-            report_host(local_host_lookup, host, lookup_port, &group.ports).unwrap_or_else(|err| {
+            report_host(local_host_lookup, host, lookup_port, &group.ports, timeout)
+                .unwrap_or_else(|err| {
                 vec![ReportItem::from_io_error(
                     ReportPair {
                         local: local_host_lookup.clone(),
@@ -330,6 +347,8 @@ fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup) -
                         port: lookup_port,
                     },
                     err,
+                    Instant::now(),
+                    Duration::from_millis(0),
                 )]
             })
         })
@@ -381,6 +400,9 @@ fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
 fn main() {
     env_logger::init();
     const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
+    let default_timeout_str = "7s";
+    let default_timeout: Duration = DurationString::from_string(default_timeout_str.to_string())
+        .unwrap().into();
 
     let appmatches = clap::App::new("ackreport")
         .version(VERSION.unwrap_or("v0"))
@@ -392,6 +414,15 @@ fn main() {
                 .required(false)
                 .takes_value(true)
                 .env("RAYON_NUM_THREADS"),
+        )
+        .arg(
+            clap::Arg::with_name("timeout")
+                .help("Connection timeout (eg 10s or 500ms)")
+                .short("t")
+                .long("timeout")
+                .required(false)
+                .takes_value(true)
+                .default_value(&default_timeout_str)
         )
         .arg(
             clap::Arg::with_name("dest")
@@ -412,6 +443,17 @@ fn main() {
     let src_hostname = get_hostname();
     let mut tw = TabWriter::new(io::stdout());
 
+    let timeout: Duration =
+        DurationString::from_string(
+            appmatches.value_of("timeout")
+                .expect("timeout has default, this must be present")
+                .to_string())
+            .map(|ds| ds.into())
+            .unwrap_or_else(|e| {
+                error!("Could not parse timeout arg: {}; using default {:?}", e, default_timeout);
+                default_timeout
+            });
+
     if appmatches.is_present("interfaces") {
         report_interfaces(&mut tw, &src_hostname)
     }
@@ -425,13 +467,13 @@ fn main() {
     }
 
     let local_host_fallback = HostLookup {
-        hostname: src_hostname.clone(),
+        hostname: src_hostname,
         ip: None,
     };
 
     let report_todo: Vec<_> = dests
         .iter()
-        .map(|group| report_hosts_ports(&local_host_fallback, &group))
+        .map(|group| report_hosts_ports(&local_host_fallback, &group, timeout))
         .flatten()
         .collect();
 
