@@ -1,6 +1,6 @@
 [package]
 name = "ackreport"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["roller@gmail.com"]
 edition = "2018"
 
@@ -14,3 +14,7 @@ itertools = "0.8"
 tabwriter = "1.1.0"
 rayon = "1.1.0"
 duration-string = "0.0.6"
+rustls = "0.18"
+webpki = "0.21"
+webpki-roots = "0.20"
+rustls-native-certs = "0.4"

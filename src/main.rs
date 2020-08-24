@@ -5,11 +5,13 @@ use std::net;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Instant, Duration};
 
+use std::sync::Arc;
 use duration_string::DurationString;
 use itertools::Itertools;
-use log::{debug, error, log};
+use log::{debug, info, error};
 use tabwriter::TabWriter;
 use rayon::prelude::*;
+use rustls::Session;
 
 // Group of hosts and ports to attempt connections
 #[derive(Debug)]
@@ -28,8 +30,69 @@ struct HostLookup {
 impl std::fmt::Display for HostLookup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.ip {
-            Some(ip) => write!(f, "{} {}", self.hostname, ip),
+            Some(ip) => {
+                let ip_str = ip.to_string();
+                if self.hostname == ip_str {
+                    write!(f, "{}", ip_str)
+                } else {
+                    write!(f, "{} {}", self.hostname, ip_str)
+                }
+            }
             None => write!(f, "{}", self.hostname),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TlsResult {
+    NotChecked,
+    TlsOk {
+        protocol_version: rustls::ProtocolVersion,
+    },
+    InvalidDNSNameError,
+    IncompleteHandshake,
+    IoErr(io::Error),
+    TlsErr(rustls::TLSError)
+}
+
+
+impl From<io::Error> for TlsResult {
+    fn from(error: io::Error) -> Self {
+        let kind = error.kind();
+        match kind {
+            io::ErrorKind::InvalidData => {
+                let tls_error = error.get_ref().map(|r| r.downcast_ref::<rustls::TLSError>() ).flatten();
+                match tls_error {
+                    Some(rustls::TLSError::CorruptMessage) => TlsResult::IncompleteHandshake,
+                    Some(t) => TlsResult::from(t),
+                    None => TlsResult::IoErr(error)
+                }
+            },
+            _ => TlsResult::IoErr(error)
+        }
+    }
+}
+
+impl From<&rustls::TLSError> for TlsResult {
+    fn from(error: &rustls::TLSError) -> Self {
+        TlsResult::TlsErr(error.clone())
+    }
+}
+
+impl From<webpki::InvalidDNSNameError> for TlsResult {
+    fn from(_error: webpki::InvalidDNSNameError) -> Self {
+        TlsResult::InvalidDNSNameError
+    }
+}
+
+impl std::fmt::Display for TlsResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsResult::TlsOk {
+                protocol_version: version
+            } => write!(f, "{:?}", version),
+            TlsResult::TlsErr(tls_err) => write!(f, "{}", tls_err),
+            _ => write!(f, "{:?}", self),
         }
     }
 }
@@ -39,6 +102,7 @@ enum ConnectResult {
     Open {
         local: net::SocketAddr,
         peer: net::SocketAddr,
+        tls: TlsResult,
     },
     Closed,
     Filtered,
@@ -46,15 +110,17 @@ enum ConnectResult {
     OtherIoError(io::Error),
 }
 
-impl From<io::Result<net::TcpStream>> for ConnectResult {
-    fn from(result: io::Result<net::TcpStream>) -> ConnectResult {
-        match result {
+
+impl ConnectResult {
+    fn from_result(tcp_result: io::Result<net::TcpStream>, tls_result: TlsResult) -> ConnectResult {
+        match tcp_result {
             Ok(stream) => {
                 let local = stream.local_addr();
                 let peer = stream.peer_addr();
                 ConnectResult::Open {
                     local: local.expect("TCP stream should have local IP"),
                     peer: peer.expect("TCP stream should have peer IP"),
+                    tls: tls_result,
                 }
             }
             Err(e) => match e.kind() {
@@ -66,10 +132,18 @@ impl From<io::Result<net::TcpStream>> for ConnectResult {
     }
 }
 
+impl From<io::Result<net::TcpStream>> for ConnectResult {
+    // assumed to be only used when Tls is not checked
+    fn from(tcp_result: io::Result<net::TcpStream>) -> Self {
+        Self::from_result(tcp_result, TlsResult::NotChecked)
+    }
+}
+
 impl std::fmt::Display for ConnectResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectResult::Open { .. } => write!(f, "Open"),
+            ConnectResult::Open { tls: TlsResult::NotChecked, .. } => write!(f, "Open"),
+            ConnectResult::Open { tls: tls_result, .. } => tls_result.fmt(f),
             ConnectResult::Closed => write!(f, "Closed"),
             ConnectResult::Filtered => write!(f, "Filtered"),
             ConnectResult::EmptySocketAddrs => write!(f, "EmptySocketAddrs"),
@@ -85,8 +159,8 @@ enum ReportItem {
 }
 
 impl ReportItem {
-    fn from_sock(pair: ReportPair, sock: SocketAddr, timeout: Duration) -> ReportItem {
-        ReportItem::Todo(ReportTodo { pair, sock, timeout })
+    fn from_sock(pair: ReportPair, sock: SocketAddr, timeout: Duration, tls: bool) -> ReportItem {
+        ReportItem::Todo(ReportTodo { pair, sock, timeout, tls })
     }
     fn from_connect_result(pair: ReportPair, result: ConnectResult, start: Instant, duration: Duration) -> ReportItem {
         ReportItem::Done(ReportDone::from_connect_result(pair, result, start, duration))
@@ -116,17 +190,66 @@ struct ReportPair {
 struct ReportTodo {
     pair: ReportPair,
     sock: SocketAddr,
-    timeout: Duration
+    timeout: Duration,
+    tls: bool
 }
 
 impl ReportTodo {
+
+    fn check_tls(self: &ReportTodo, stream: &mut net::TcpStream, timeout: Duration) -> Result<TlsResult,TlsResult> {
+        stream.set_write_timeout(Some(timeout))?;
+        stream.set_read_timeout(Some(timeout))?;
+        let mut config = rustls::ClientConfig::new();
+        config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+        let rc_config = Arc::new(config);
+        let dns_name = &self.pair.peer.hostname;
+        let dns_ref = webpki::DNSNameRef::try_from_ascii_str(dns_name)?;
+        let mut client = rustls::ClientSession::new(&rc_config, dns_ref);
+
+        let completed = client.complete_io(stream);
+        debug!("completed tls io: {:?}", completed);
+        completed?;
+        let ciphersuite = client.get_negotiated_ciphersuite();
+        let protoversion = client.get_protocol_version();
+        info!("tls {}: ciphersuite: {:?}, proto {:?}", dns_name, ciphersuite, protoversion);
+
+        // TODO: Find some useful cert info information to log (subject, san, valid dates)
+        /*
+        if let Some(certs) = client.get_peer_certificates() {
+            for cert in certs {
+                info!("peer cert: {:?}", cert);
+            }
+        }
+        */
+
+        client.send_close_notify();
+        // finishing close notify is not considered a reportable error
+        let _ = client.complete_io(stream);
+
+        Ok(TlsResult::TlsOk {
+            protocol_version: client.get_protocol_version().unwrap_or(rustls::ProtocolVersion::Unknown(0))
+        })
+    }
+
     fn check_connect(self: ReportTodo) -> ReportDone {
         let start = Instant::now();
-        let t = net::TcpStream::connect_timeout(
+        let mut t = net::TcpStream::connect_timeout(
             &self.sock, self.timeout);
-        let duration = Instant::now() - start;
+        let mut duration = Instant::now() - start;
         debug!("tcp connect addr {:?} returned {:?} in {:?}", self.sock, t, duration);
-        ReportDone::from_connect_result(self.pair, t.into(), start, duration)
+        // watch out for panic in Sub
+        let next_timeout = if self.timeout > duration { self.timeout - duration } else { Duration::from_millis(0) };
+        let mut tls_result = TlsResult::NotChecked;
+        if let Ok(mut stream) = t {
+            if self.tls {
+                tls_result = self.check_tls(&mut stream, next_timeout)
+                    .unwrap_or_else(|e| e);
+                duration = Instant::now() - start;
+            }
+            t = Ok(stream)
+        }
+        let result = ConnectResult::from_result(t, tls_result);
+        ReportDone::from_connect_result(self.pair, result, start, duration)
     }
 }
 
@@ -135,18 +258,19 @@ struct ReportDone {
     pair: ReportPair,
     result: ConnectResult,
     start: Instant,
-    duration: Duration
+    duration: Duration,
 }
 
 impl ReportDone {
     fn from_connect_result(pair: ReportPair, result: ConnectResult,
                            start: Instant, duration: Duration)-> ReportDone {
-        match result {
+        match &result {
             // for open connections, replace initial guesses
             // with actual ips used
             ConnectResult::Open {
                 local: local_addr,
                 peer: peer_addr,
+                tls: _tls_result,
             } => ReportDone {
                 pair: ReportPair {
                     local: HostLookup {
@@ -187,9 +311,8 @@ impl ReportDone {
     fn println<W: Write>(&self, tw: &mut TabWriter<W>) {
         let r = writeln!(
             tw,
-            "{}\t{}\t:{}\t{}\t{}",
-            self.pair.local, self.pair.peer, self.pair.port, self.result,
-            DurationString::from(self.duration)
+            "{}\t{}\t:{}\t{}\t{:?}",
+            self.pair.local, self.pair.peer, self.pair.port, self.result, self.duration
         );
         if let Err(e) = r {
             error!("Error writing report item: {}", e);
@@ -261,10 +384,11 @@ fn report_host_port(
     pair: ReportPair,
     sock_addr: net::SocketAddr,
     timeout: Duration,
+    tls: bool
 ) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (sock_addr.ip(), pair.port).to_socket_addrs()?;
     let mut report: Vec<ReportItem> = socket_addrs
-        .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout))
+        .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout, tls))
         .collect();
     if report.is_empty() {
         // should never happen, but if it does, report it
@@ -284,6 +408,7 @@ fn report_host(
     lookup_port: u16,
     ports: &[u16],
     timeout: Duration,
+    tls: bool,
 ) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (host, lookup_port).to_socket_addrs()?;
     let host_report: Vec<_> = socket_addrs
@@ -304,6 +429,7 @@ fn report_host(
                         },
                         s,
                         timeout,
+                        tls,
                     )
                     .unwrap_or_else(|err| {
                         vec![ReportItem::from_io_error(
@@ -327,7 +453,7 @@ fn report_host(
     Ok(host_report)
 }
 
-fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, timeout: Duration) -> Vec<ReportItem> {
+fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, timeout: Duration, tls: bool) -> Vec<ReportItem> {
     // assume that any port will result in the same lookup,
     // so use the first port just to find the dest ip
     let lookup_port = group.ports.get(0).map_or(443, |p| *p);
@@ -335,7 +461,7 @@ fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, t
         .hostnames
         .iter()
         .map(|host| {
-            report_host(local_host_lookup, host, lookup_port, &group.ports, timeout)
+            report_host(local_host_lookup, host, lookup_port, &group.ports, timeout, tls)
                 .unwrap_or_else(|err| {
                 vec![ReportItem::from_io_error(
                     ReportPair {
@@ -413,7 +539,7 @@ fn main() {
                 .long("threads")
                 .required(false)
                 .takes_value(true)
-                .env("RAYON_NUM_THREADS"),
+                .env("RAYON_NUM_THREADS")
         )
         .arg(
             clap::Arg::with_name("timeout")
@@ -428,14 +554,20 @@ fn main() {
             clap::Arg::with_name("dest")
                 .help("Destination hostnames and :ports")
                 .multiple(true)
-                .required(true),
+                .required(true)
         )
         .arg(
             clap::Arg::with_name("interfaces")
                 .help("Show interfaces")
                 .short("i")
                 .long("interfaces")
-                .takes_value(false),
+                .takes_value(false)
+        )
+        .arg(
+            clap::Arg::with_name("tls")
+                .help("Attempt TLS negotiation")
+                .long("tls")
+                .takes_value(false)
         )
         .get_matches();
 
@@ -457,6 +589,7 @@ fn main() {
     if appmatches.is_present("interfaces") {
         report_interfaces(&mut tw, &src_hostname)
     }
+    let tls = appmatches.is_present("tls");
 
     let arg_threads = appmatches.value_of("threads");
     if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || arg_threads.is_some() {
@@ -473,7 +606,7 @@ fn main() {
 
     let report_todo: Vec<_> = dests
         .iter()
-        .map(|group| report_hosts_ports(&local_host_fallback, &group, timeout))
+        .map(|group| report_hosts_ports(&local_host_fallback, &group, timeout, tls))
         .flatten()
         .collect();
 
