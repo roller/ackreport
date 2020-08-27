@@ -51,6 +51,7 @@ enum TlsResult {
     },
     InvalidDNSNameError,
     IncompleteHandshake,
+    TlsIoTimeout,
     IoErr(io::Error),
     TlsErr(rustls::TLSError)
 }
@@ -68,6 +69,12 @@ impl From<io::Error> for TlsResult {
                     None => TlsResult::IoErr(error)
                 }
             },
+            // Example Windows Timeout error:
+            // Os { code: 10060, kind: TimedOut, message: "A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond." }
+            io::ErrorKind::TimedOut => TlsResult::TlsIoTimeout,
+            // Example Linux Timeout error:
+            // Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }
+            io::ErrorKind::WouldBlock => TlsResult::TlsIoTimeout,
             _ => TlsResult::IoErr(error)
         }
     }
@@ -302,7 +309,7 @@ impl ReportDone {
     }
 
     fn header<W: Write>(tw: &mut TabWriter<W>) {
-        let r = writeln!(tw, "Local\tPeer\tPort\tResult\tTime");
+        let r = writeln!(tw, "Local\tPeer\tPort\tTime\tResult");
         if let Err(e) = r {
             error!("Error writing header: {}", e);
         }
@@ -311,8 +318,8 @@ impl ReportDone {
     fn println<W: Write>(&self, tw: &mut TabWriter<W>) {
         let r = writeln!(
             tw,
-            "{}\t{}\t:{}\t{}\t{:?}",
-            self.pair.local, self.pair.peer, self.pair.port, self.result, self.duration
+            "{}\t{}\t:{}\t{:0.0?}\t{}",
+            self.pair.local, self.pair.peer, self.pair.port, self.duration, self.result
         );
         if let Err(e) = r {
             error!("Error writing report item: {}", e);
