@@ -166,8 +166,8 @@ enum ReportItem {
 }
 
 impl ReportItem {
-    fn from_sock(pair: ReportPair, sock: SocketAddr, timeout: Duration, tls: bool) -> ReportItem {
-        ReportItem::Todo(ReportTodo { pair, sock, timeout, tls })
+    fn from_sock(pair: ReportPair, sock: SocketAddr, timeout: Duration) -> ReportItem {
+        ReportItem::Todo(ReportTodo { pair, sock, timeout })
     }
     fn from_connect_result(pair: ReportPair, result: ConnectResult, start: Instant, duration: Duration) -> ReportItem {
         ReportItem::Done(ReportDone::from_connect_result(pair, result, start, duration))
@@ -175,13 +175,10 @@ impl ReportItem {
     fn from_io_error(pair: ReportPair, err: io::Error, start: Instant, duration: Duration) -> ReportItem {
         ReportItem::Done(ReportDone::from_io_error(pair, err, start, duration))
     }
-}
-
-impl From<ReportItem> for ReportDone {
-    fn from(item: ReportItem) -> ReportDone {
-        match item {
+    fn check_connect(self, tls_config: &Option<Arc<rustls::ClientConfig>>) -> ReportDone {
+        match self {
             ReportItem::Done(done) => done,
-            ReportItem::Todo(todo) => todo.check_connect(),
+            ReportItem::Todo(todo) => todo.check_connect(tls_config),
         }
     }
 }
@@ -198,20 +195,16 @@ struct ReportTodo {
     pair: ReportPair,
     sock: SocketAddr,
     timeout: Duration,
-    tls: bool
 }
 
 impl ReportTodo {
 
-    fn check_tls(self: &ReportTodo, stream: &mut net::TcpStream, timeout: Duration) -> Result<TlsResult,TlsResult> {
+    fn check_tls(self: &ReportTodo, stream: &mut net::TcpStream, timeout: Duration, tls_config: &Arc<rustls::ClientConfig>) -> Result<TlsResult,TlsResult> {
         stream.set_write_timeout(Some(timeout))?;
         stream.set_read_timeout(Some(timeout))?;
-        let mut config = rustls::ClientConfig::new();
-        config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-        let rc_config = Arc::new(config);
         let dns_name = &self.pair.peer.hostname;
         let dns_ref = webpki::DNSNameRef::try_from_ascii_str(dns_name)?;
-        let mut client = rustls::ClientSession::new(&rc_config, dns_ref);
+        let mut client = rustls::ClientSession::new(tls_config, dns_ref);
 
         let completed = client.complete_io(stream);
         debug!("completed tls io: {:?}", completed);
@@ -238,7 +231,7 @@ impl ReportTodo {
         })
     }
 
-    fn check_connect(self: ReportTodo) -> ReportDone {
+    fn check_connect(self: ReportTodo, tls_config: &Option<Arc<rustls::ClientConfig>>) -> ReportDone {
         let start = Instant::now();
         let mut t = net::TcpStream::connect_timeout(
             &self.sock, self.timeout);
@@ -248,8 +241,8 @@ impl ReportTodo {
         let next_timeout = if self.timeout > duration { self.timeout - duration } else { Duration::from_millis(0) };
         let mut tls_result = TlsResult::NotChecked;
         if let Ok(mut stream) = t {
-            if self.tls {
-                tls_result = self.check_tls(&mut stream, next_timeout)
+            if let Some(tls_config) = tls_config {
+                tls_result = self.check_tls(&mut stream, next_timeout, tls_config)
                     .unwrap_or_else(|e| e);
                 duration = Instant::now() - start;
             }
@@ -391,11 +384,10 @@ fn report_host_port(
     pair: ReportPair,
     sock_addr: net::SocketAddr,
     timeout: Duration,
-    tls: bool
 ) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (sock_addr.ip(), pair.port).to_socket_addrs()?;
     let mut report: Vec<ReportItem> = socket_addrs
-        .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout, tls))
+        .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout))
         .collect();
     if report.is_empty() {
         // should never happen, but if it does, report it
@@ -415,7 +407,6 @@ fn report_host(
     lookup_port: u16,
     ports: &[u16],
     timeout: Duration,
-    tls: bool,
 ) -> Result<Vec<ReportItem>, io::Error> {
     let socket_addrs = (host, lookup_port).to_socket_addrs()?;
     let host_report: Vec<_> = socket_addrs
@@ -436,7 +427,6 @@ fn report_host(
                         },
                         s,
                         timeout,
-                        tls,
                     )
                     .unwrap_or_else(|err| {
                         vec![ReportItem::from_io_error(
@@ -460,7 +450,7 @@ fn report_host(
     Ok(host_report)
 }
 
-fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, timeout: Duration, tls: bool) -> Vec<ReportItem> {
+fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, timeout: Duration) -> Vec<ReportItem> {
     // assume that any port will result in the same lookup,
     // so use the first port just to find the dest ip
     let lookup_port = group.ports.get(0).map_or(443, |p| *p);
@@ -468,7 +458,7 @@ fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, t
         .hostnames
         .iter()
         .map(|host| {
-            report_host(local_host_lookup, host, lookup_port, &group.ports, timeout, tls)
+            report_host(local_host_lookup, host, lookup_port, &group.ports, timeout)
                 .unwrap_or_else(|err| {
                 vec![ReportItem::from_io_error(
                     ReportPair {
@@ -530,6 +520,14 @@ fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum TlsMode {
+    NativeRoots,
+    MozillaRoots,
+}
+
+
+
 fn main() {
     env_logger::init();
     const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
@@ -572,9 +570,18 @@ fn main() {
         )
         .arg(
             clap::Arg::with_name("tls")
-                .help("Attempt TLS negotiation")
+                .help("Attempt TLS negotiation with OS cert roots")
                 .long("tls")
+                .alias("tls-native-roots")
                 .takes_value(false)
+        )
+        .arg(
+            clap::Arg::with_name("tls-moz-roots")
+                .help("Attempt TLS with mozilla cert roots")
+                .long("tls-moz-roots")
+                .alias("tls-mozilla-roots")
+                .takes_value(false)
+                .conflicts_with("tls")
         )
         .get_matches();
 
@@ -596,7 +603,29 @@ fn main() {
     if appmatches.is_present("interfaces") {
         report_interfaces(&mut tw, &src_hostname)
     }
-    let tls = appmatches.is_present("tls");
+
+    let tls_arg = if appmatches.is_present("tls") {
+        Some(TlsMode::NativeRoots)
+    } else if appmatches.is_present("tls-moz-roots") {
+        Some(TlsMode::MozillaRoots)
+    } else {
+        None
+    };
+    let tls_config = if let Some(tls_mode) = tls_arg {
+        let mut config = rustls::ClientConfig::new();
+        match tls_mode {
+            TlsMode::MozillaRoots => {
+                config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+            }
+            TlsMode::NativeRoots => {
+                let cert_store = rustls_native_certs::load_native_certs().expect("Could not load native platform TLS root certs (try --tls-moz-roots?)");
+                config.root_store = cert_store;
+            }
+        }
+        Some(Arc::new(config))
+    } else {
+        None
+    };
 
     let arg_threads = appmatches.value_of("threads");
     if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || arg_threads.is_some() {
@@ -613,11 +642,11 @@ fn main() {
 
     let report_todo: Vec<_> = dests
         .iter()
-        .map(|group| report_hosts_ports(&local_host_fallback, &group, timeout, tls))
+        .map(|group| report_hosts_ports(&local_host_fallback, &group, timeout))
         .flatten()
         .collect();
 
-    let report_done: Vec<_> = report_todo.into_par_iter().map(ReportDone::from).collect();
+    let report_done: Vec<_> = report_todo.into_par_iter().map(|r| r.check_connect(&tls_config)).collect();
 
     ReportDone::header(&mut tw);
     for item in report_done {
