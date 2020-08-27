@@ -58,8 +58,3 @@ Copy the binary to your path.
 
 ## License
 [MIT](https://choosealicense.com/licenses/mit/)
-
-## TODO
-
-- provide more info with certificate chain subjects, expire dates
-

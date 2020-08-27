@@ -2,7 +2,7 @@
 # It is not intended for manual editing.
 [[package]]
 name = "ackreport"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap 2.32.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "duration-string 0.0.6 (registry+https://github.com/rust-lang/crates.io-index)",

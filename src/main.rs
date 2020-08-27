@@ -213,15 +213,6 @@ impl ReportTodo {
         let protoversion = client.get_protocol_version();
         info!("tls {}: ciphersuite: {:?}, proto {:?}", dns_name, ciphersuite, protoversion);
 
-        // TODO: Find some useful cert info information to log (subject, san, valid dates)
-        /*
-        if let Some(certs) = client.get_peer_certificates() {
-            for cert in certs {
-                info!("peer cert: {:?}", cert);
-            }
-        }
-        */
-
         client.send_close_notify();
         // finishing close notify is not considered a reportable error
         let _ = client.complete_io(stream);
