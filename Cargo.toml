@@ -4,6 +4,9 @@ version = "0.2.2"
 authors = ["roller@gmail.com"]
 edition = "2018"
 
+[profile.release]
+lto = true
+
 [dependencies]
 clap = "~2.32.0"
 get_if_addrs = "0.5.3"

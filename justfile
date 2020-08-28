@@ -40,13 +40,16 @@ release_bin_wsl:
     set -xe
     version=$(cargo run --release -- --version | awk '{ print $2 }')
 
+    # linux
     toolchain=x86_64-unknown-linux-gnu
     cargo +stable-$toolchain build --release
+    strip target/release/ackreport
     cp target/release/ackreport{,-$toolchain-$version}
 
-    # build gnu to avoid msvcrt dep
+    # windows, build gnu to avoid msvcrt dep
     toolchain=x86_64-pc-windows-gnu
     cargo.exe +stable-$toolchain build --release
+    strip.exe target/release/ackreport
     cp target/release/ackreport{,-$toolchain-$version}.exe
 
 # update readme and binaries
