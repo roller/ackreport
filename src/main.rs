@@ -56,6 +56,15 @@ enum TlsResult {
     TlsErr(rustls::TLSError)
 }
 
+impl TlsResult {
+    fn seems_ok(&self) -> bool {
+        match self {
+            TlsResult::NotChecked |
+            TlsResult::TlsOk { .. } => true,
+            _ => false,
+        }
+    }
+}
 
 impl From<io::Error> for TlsResult {
     fn from(error: io::Error) -> Self {
@@ -135,6 +144,15 @@ impl ConnectResult {
                 io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
                 _ => ConnectResult::OtherIoError(e),
             },
+        }
+    }
+
+    // It's ok if the connection opened ok,
+    // and any TLS handshake succeeded
+    fn seems_ok(&self) -> bool {
+        match self {
+            ConnectResult::Open { tls, .. } => tls.seems_ok(),
+            _ => false
         }
     }
 }
@@ -292,22 +310,16 @@ impl ReportDone {
         }
     }
 
-    fn header<W: Write>(tw: &mut TabWriter<W>) {
-        let r = writeln!(tw, "Local\tPeer\tPort\tTime\tResult");
-        if let Err(e) = r {
-            error!("Error writing header: {}", e);
-        }
+    fn header<W: Write>(tw: &mut TabWriter<W>) -> io::Result<()> {
+        writeln!(tw, "Local\tPeer\tPort\tTime\tResult")
     }
 
-    fn println<W: Write>(&self, tw: &mut TabWriter<W>) {
-        let r = writeln!(
+    fn println<W: Write>(&self, tw: &mut TabWriter<W>) -> io::Result<()> {
+        writeln!(
             tw,
             "{}\t{}\t:{}\t{:0.0?}\t{}",
             self.pair.local, self.pair.peer, self.pair.port, self.duration, self.result
-        );
-        if let Err(e) = r {
-            error!("Error writing report item: {}", e);
-        }
+        )
     }
 }
 
@@ -517,9 +529,18 @@ enum TlsMode {
     MozillaRoots,
 }
 
+fn report_exit_code(report: &[ReportDone]) -> i32 {
+    if report
+        .iter()
+        .all(|r| r.result.seems_ok()) {
+        0
+    } else {
+        1
+    }
+}
 
 
-fn main() {
+fn main() -> io::Result<()> {
     env_logger::init();
     const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
     let default_timeout_str = "7s";
@@ -639,12 +660,11 @@ fn main() {
 
     let report_done: Vec<_> = report_todo.into_par_iter().map(|r| r.check_connect(&tls_config)).collect();
 
-    ReportDone::header(&mut tw);
-    for item in report_done {
-        item.println(&mut tw);
+    ReportDone::header(&mut tw)?;
+    for item in &report_done {
+        item.println(&mut tw)?;
     }
+    tw.flush()?;
 
-    if let Err(e) = tw.flush() {
-        error!("Couldn't flush tab writer: {}", e);
-    }
+    std::process::exit(report_exit_code(&report_done));
 }
