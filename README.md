@@ -84,7 +84,7 @@ abc101 192.168.1.101  mitm-software.badssl.com 104.154.89.105   :443  116ms  inv
 ```
 
 The `--tls` option uses OS certificate roots.
-Using `--tls-moz-roots` instead will use the mozilla certificate bundle statically compiled into the binary.
+Using `--tls-moz` instead will use the mozilla certificate bundle statically compiled into the binary.
 The [rustls-native-certs README](https://github.com/ctz/rustls-native-certs/blob/main/README.md) has some Pros and Cons of each.
 
 ## Installation

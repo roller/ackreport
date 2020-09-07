@@ -48,7 +48,7 @@ exec: cargo run --release -- --tls badssl.com :80 badssl.com :99 no-common-name.
 ```
 
 The `--tls` option uses OS certificate roots.
-Using `--tls-moz-roots` instead will use the mozilla certificate bundle statically compiled into the binary.
+Using `--tls-moz` instead will use the mozilla certificate bundle statically compiled into the binary.
 The [rustls-native-certs README](https://github.com/ctz/rustls-native-certs/blob/main/README.md) has some Pros and Cons of each.
 
 ## Installation

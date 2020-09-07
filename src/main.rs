@@ -529,6 +529,24 @@ enum TlsMode {
     MozillaRoots,
 }
 
+fn rustls_client_config(tls_arg: Option<TlsMode>) -> Option<Arc<rustls::ClientConfig>> {
+    if let Some(tls_mode) = tls_arg {
+        let mut config = rustls::ClientConfig::new();
+        match tls_mode {
+            TlsMode::MozillaRoots => {
+                config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+            }
+            TlsMode::NativeRoots => {
+                let cert_store = rustls_native_certs::load_native_certs().expect("Could not load native platform TLS root certs (try --tls-moz?)");
+                config.root_store = cert_store;
+            }
+        }
+        Some(Arc::new(config))
+    } else {
+        None
+    }
+}
+
 fn report_exit_code(report: &[ReportDone]) -> i32 {
     if report
         .iter()
@@ -538,7 +556,6 @@ fn report_exit_code(report: &[ReportDone]) -> i32 {
         1
     }
 }
-
 
 fn main() -> io::Result<()> {
     env_logger::init();
@@ -582,15 +599,16 @@ fn main() -> io::Result<()> {
         )
         .arg(
             clap::Arg::with_name("tls")
-                .help("Attempt TLS negotiation with OS cert roots")
+                .help("Attempt TLS handshake with OS cert roots")
                 .long("tls")
                 .alias("tls-native-roots")
                 .takes_value(false)
         )
         .arg(
             clap::Arg::with_name("tls-moz-roots")
-                .help("Attempt TLS with mozilla cert roots")
-                .long("tls-moz-roots")
+                .help("Attempt TLS handshake with mozilla cert roots")
+                .long("tls-moz")
+                .alias("tls-moz-roots")
                 .alias("tls-mozilla-roots")
                 .takes_value(false)
                 .conflicts_with("tls")
@@ -618,26 +636,12 @@ fn main() -> io::Result<()> {
 
     let tls_arg = if appmatches.is_present("tls") {
         Some(TlsMode::NativeRoots)
-    } else if appmatches.is_present("tls-moz-roots") {
+    } else if appmatches.is_present("tls-moz") {
         Some(TlsMode::MozillaRoots)
     } else {
         None
     };
-    let tls_config = if let Some(tls_mode) = tls_arg {
-        let mut config = rustls::ClientConfig::new();
-        match tls_mode {
-            TlsMode::MozillaRoots => {
-                config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-            }
-            TlsMode::NativeRoots => {
-                let cert_store = rustls_native_certs::load_native_certs().expect("Could not load native platform TLS root certs (try --tls-moz-roots?)");
-                config.root_store = cert_store;
-            }
-        }
-        Some(Arc::new(config))
-    } else {
-        None
-    };
+    let tls_config = rustls_client_config(tls_arg);
 
     let arg_threads = appmatches.value_of("threads");
     if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || arg_threads.is_some() {
