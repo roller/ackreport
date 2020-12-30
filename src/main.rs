@@ -116,8 +116,8 @@ impl std::fmt::Display for TlsResult {
 #[derive(Debug)]
 enum ConnectResult {
     Open {
-        local: net::SocketAddr,
-        peer: net::SocketAddr,
+        local: Option<net::SocketAddr>,
+        peer: Option<net::SocketAddr>,
         tls: TlsResult,
     },
     Closed,
@@ -126,18 +126,34 @@ enum ConnectResult {
     OtherIoError(io::Error),
 }
 
+// Convert to option, logging errors
+fn ok_or_log<O,E>(res: Result<O,E>, msg: &str) -> Option<O>
+    where E: std::fmt::Debug
+{
+    match res {
+        Err(e) => {
+            error!("{}: {:?}", msg, e);
+            None
+        },
+        Ok(x) => Some(x)
+    }
+}
 
 impl ConnectResult {
-    fn from_result(tcp_result: io::Result<net::TcpStream>, tls_result: TlsResult) -> ConnectResult {
+    fn from_open_ips(
+        local_sock: std::io::Result<net::SocketAddr>,
+        peer_sock: std::io::Result<net::SocketAddr>,
+        tls: TlsResult
+    ) -> ConnectResult {
+        let local = ok_or_log(local_sock, "TCP stream couldn't get local ip");
+        let peer = ok_or_log(peer_sock, "TCP stream couldn't get peer ip");
+        ConnectResult::Open { local, peer, tls }
+    }
+
+    fn from_result(tcp_result: io::Result<net::TcpStream>) -> ConnectResult {
         match tcp_result {
             Ok(stream) => {
-                let local = stream.local_addr();
-                let peer = stream.peer_addr();
-                ConnectResult::Open {
-                    local: local.expect("TCP stream should have local IP"),
-                    peer: peer.expect("TCP stream should have peer IP"),
-                    tls: tls_result,
-                }
+                Self::from_open_ips(stream.local_addr(), stream.peer_addr(), TlsResult::NotChecked)
             }
             Err(e) => match e.kind() {
                 io::ErrorKind::TimedOut => ConnectResult::Filtered,
@@ -160,7 +176,7 @@ impl ConnectResult {
 impl From<io::Result<net::TcpStream>> for ConnectResult {
     // assumed to be only used when Tls is not checked
     fn from(tcp_result: io::Result<net::TcpStream>) -> Self {
-        Self::from_result(tcp_result, TlsResult::NotChecked)
+        Self::from_result(tcp_result)
     }
 }
 
@@ -242,22 +258,25 @@ impl ReportTodo {
 
     fn check_connect(self: ReportTodo, tls_config: &Option<Arc<rustls::ClientConfig>>) -> ReportDone {
         let start = Instant::now();
-        let mut t = net::TcpStream::connect_timeout(
+        let t = net::TcpStream::connect_timeout(
             &self.sock, self.timeout);
         let mut duration = Instant::now() - start;
         debug!("tcp connect addr {:?} returned {:?} in {:?}", self.sock, t, duration);
         // watch out for panic in Sub
         let next_timeout = if self.timeout > duration { self.timeout - duration } else { Duration::from_millis(0) };
-        let mut tls_result = TlsResult::NotChecked;
-        if let Ok(mut stream) = t {
+        let result = if let Ok(mut stream) = t {
+            let local = stream.local_addr();
+            let peer = stream.peer_addr();
+            let mut tls_result = TlsResult::NotChecked;
             if let Some(tls_config) = tls_config {
                 tls_result = self.check_tls(&mut stream, next_timeout, tls_config)
                     .unwrap_or_else(|e| e);
                 duration = Instant::now() - start;
             }
-            t = Ok(stream)
-        }
-        let result = ConnectResult::from_result(t, tls_result);
+            ConnectResult::from_open_ips(local, peer, tls_result)
+        } else {
+            ConnectResult::from_result(t)
+        };
         ReportDone::from_connect_result(self.pair, result, start, duration)
     }
 }
@@ -284,11 +303,11 @@ impl ReportDone {
                 pair: ReportPair {
                     local: HostLookup {
                         hostname: pair.local.hostname,
-                        ip: Some(local_addr.ip()),
+                        ip: local_addr.map(|x| x.ip()),
                     },
                     peer: HostLookup {
                         hostname: pair.peer.hostname,
-                        ip: Some(peer_addr.ip()),
+                        ip: peer_addr.map(|x| x.ip()),
                     },
                     port: pair.port,
                 },
@@ -605,7 +624,7 @@ fn main() -> io::Result<()> {
                 .takes_value(false)
         )
         .arg(
-            clap::Arg::with_name("tls-moz-roots")
+            clap::Arg::with_name("tls-moz")
                 .help("Attempt TLS handshake with mozilla cert roots")
                 .long("tls-moz")
                 .alias("tls-moz-roots")
