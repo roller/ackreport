@@ -32,6 +32,10 @@ readme:
         }
     }
 
+# build a docker image
+docker:
+    docker build .
+
 # build release binaries in WSL
 release_bin_wsl:
     #!/bin/bash
