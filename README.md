@@ -1,8 +1,10 @@
 # ackreport
 
 Attempt TCP connections and report on open ports.
-Compared to [nmap](https://nmap.org/), ackreport has no features but may be easier to install.
-It is meant to be a slightly more civilized "telnet test".
+
+Combines ... Rust APIs into a command line:
+ - TCP Connect
+ - rustls
 
 ## Usage
 
@@ -11,17 +13,17 @@ Arguments starting with : are interpretted as port numbers.
 For hostnames that return multiple IP addresses, all addresses will be checked.
 
 ```
-ackreport 0.2.2
+ackreport 0.2.3
 
 USAGE:
     ackreport [FLAGS] [OPTIONS] <dest>...
 
 FLAGS:
-    -h, --help             Prints help information
-    -i, --interfaces       Show interfaces
-        --tls              Attempt TLS negotiation with OS cert roots
-        --tls-moz-roots    Attempt TLS with mozilla cert roots
-    -V, --version          Prints version information
+    -h, --help          Prints help information
+    -i, --interfaces    Show interfaces
+        --tls           Attempt TLS handshake with OS cert roots
+        --tls-moz       Attempt TLS handshake with mozilla cert roots
+    -V, --version       Prints version information
 
 OPTIONS:
         --threads <threads>    Parallel connection attempts (default 10) [env: RAYON_NUM_THREADS=]
@@ -39,12 +41,12 @@ $ ackreport slashdot.org freshmeat.net :25 :80 :443
 
 ```
 Local                 Peer                         Port  Time  Result
-abc101                slashdot.org 216.105.38.15   :25   7s    Filtered
-abc101 192.168.1.101  slashdot.org 216.105.38.15   :80   62ms  Open
-abc101 192.168.1.101  slashdot.org 216.105.38.15   :443  69ms  Open
+abc101                slashdot.org 204.68.111.106  :25   7s    Filtered
+abc101 192.168.1.101  slashdot.org 204.68.111.106  :80   67ms  Open
+abc101 192.168.1.101  slashdot.org 204.68.111.106  :443  67ms  Open
 abc101                freshmeat.net 216.105.38.10  :25   7s    Filtered
-abc101 192.168.1.101  freshmeat.net 216.105.38.10  :80   69ms  Open
-abc101 192.168.1.101  freshmeat.net 216.105.38.10  :443  73ms  Open
+abc101 192.168.1.101  freshmeat.net 216.105.38.10  :80   66ms  Open
+abc101                freshmeat.net 216.105.38.10  :443  67ms  Closed
 ```
 
 No local IP is reported for connections that are not ACKed, the `--interfaces` option
@@ -56,6 +58,7 @@ $ ackreport -i freshmeat.net :25
 
 ```
 Local Interfaces
+abc101 192.168.1.101
 abc101 192.168.1.101
 Local                 Peer                         Port  Time  Result
 abc101                freshmeat.net 216.105.38.10  :25   7s    Filtered
@@ -71,16 +74,16 @@ $ ackreport --tls badssl.com :80 badssl.com :99 no-common-name.badssl.com wrong.
 
 ```
 Local                 Peer                                      Port  Time   Result
-abc101 192.168.1.101  badssl.com 104.154.89.105                 :80   116ms  IncompleteHandshake
+abc101 192.168.1.101  badssl.com 104.154.89.105                 :80   113ms  OpenNoTLS
 abc101                badssl.com 104.154.89.105                 :99   7s     Filtered
-abc101 192.168.1.101  no-common-name.badssl.com 104.154.89.105  :443  117ms  invalid certificate: CertExpired
-abc101 192.168.1.101  wrong.host.badssl.com 104.154.89.105      :443  120ms  invalid certificate: CertNotValidForName
-abc101 192.168.1.101  self-signed.badssl.com 104.154.89.105     :443  53ms   invalid certificate: UnknownIssuer
-abc101 192.168.1.101  revoked.badssl.com 104.154.89.105         :443  138ms  TLSv1_2
-abc101 192.168.1.101  1000-sans.badssl.com 104.154.89.105       :443  169ms  TLSv1_2
-abc101 192.168.1.101  ecc384.badssl.com 104.154.89.105          :443  145ms  TLSv1_2
-abc101 192.168.1.101  rsa8192.badssl.com 104.154.89.105         :443  138ms  TLSv1_2
-abc101 192.168.1.101  mitm-software.badssl.com 104.154.89.105   :443  116ms  invalid certificate: CertExpired
+abc101 192.168.1.101  no-common-name.badssl.com 104.154.89.105  :443  120ms  invalid certificate: CertExpired
+abc101 192.168.1.101  wrong.host.badssl.com 104.154.89.105      :443  48ms   invalid certificate: CertNotValidForName
+abc101 192.168.1.101  self-signed.badssl.com 104.154.89.105     :443  118ms  invalid certificate: UnknownIssuer
+abc101 192.168.1.101  revoked.badssl.com 104.154.89.105         :443  144ms  TLSv1_2
+abc101 192.168.1.101  1000-sans.badssl.com 104.154.89.105       :443  165ms  TLSv1_2
+abc101 192.168.1.101  ecc384.badssl.com 104.154.89.105          :443  144ms  TLSv1_2
+abc101 192.168.1.101  rsa8192.badssl.com 104.154.89.105         :443  132ms  TLSv1_2
+abc101 192.168.1.101  mitm-software.badssl.com 104.154.89.105   :443  113ms  invalid certificate: UnknownIssuer
 ```
 
 The `--tls` option uses OS certificate roots.

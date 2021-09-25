@@ -13,11 +13,53 @@ use tabwriter::TabWriter;
 use rayon::prelude::*;
 use rustls::Session;
 
-// Group of hosts and ports to attempt connections
+// Group hosts and ports to attempt connections
 #[derive(Debug)]
 struct HostsPortsGroup {
     hostnames: Vec<String>,
     ports: Vec<u16>,
+}
+
+impl HostsPortsGroup {
+    // group args host1 host2 :22 host3 :33 :44 :55
+    // into [{[host1, host2], [22]}, {[host3], [33, 44, 55]}]
+    fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
+        let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(Vec::new);
+        let mut dest_args = dest_matches.iter();
+        let mut dests: Vec<HostsPortsGroup> = vec![];
+        loop {
+            let dest_hosts = dest_args
+                .take_while_ref(|s| !s.starts_with(':'))
+                .cloned()
+                .collect_vec();
+            if dest_hosts.is_empty() {
+                break;
+            }
+            let mut dest_ports = dest_args
+                .take_while_ref(|s| s.starts_with(':'))
+                .flat_map(|s| -> Option<u16> {
+                    let s1 = s.trim_start_matches(':');
+                    let parsed = s1.parse::<u16>();
+                    match parsed {
+                        Ok(x) => Some(x),
+                        Err(e) => {
+                            error!("Couldn't parse port number, ignoring {0}, {1}", s, e);
+                            None
+                        }
+                    }
+                })
+                .collect_vec();
+            if dest_ports.is_empty() {
+                // default ports
+                dest_ports.extend([80, 443].iter());
+            }
+            dests.push(HostsPortsGroup {
+                hostnames: dest_hosts,
+                ports: dest_ports,
+            });
+        }
+        dests
+    }
 }
 
 // Hostnames and results of an DNS/host lookup
@@ -50,7 +92,7 @@ enum TlsResult {
         protocol_version: rustls::ProtocolVersion,
     },
     InvalidDNSNameError,
-    IncompleteHandshake,
+    OpenNoTLS, // aka IncompleteHandshake,
     TlsIoTimeout,
     IoErr(io::Error),
     TlsErr(rustls::TLSError)
@@ -73,7 +115,7 @@ impl From<io::Error> for TlsResult {
             io::ErrorKind::InvalidData => {
                 let tls_error = error.get_ref().map(|r| r.downcast_ref::<rustls::TLSError>() ).flatten();
                 match tls_error {
-                    Some(rustls::TLSError::CorruptMessage) => TlsResult::IncompleteHandshake,
+                    Some(rustls::TLSError::CorruptMessage) => TlsResult::OpenNoTLS,
                     Some(t) => TlsResult::from(t),
                     None => TlsResult::IoErr(error)
                 }
@@ -200,13 +242,13 @@ enum ReportItem {
 }
 
 impl ReportItem {
-    fn from_sock(pair: ReportPair, sock: SocketAddr, timeout: Duration) -> ReportItem {
+    fn from_sock(pair: ReportConnectionPair, sock: SocketAddr, timeout: Duration) -> ReportItem {
         ReportItem::Todo(ReportTodo { pair, sock, timeout })
     }
-    fn from_connect_result(pair: ReportPair, result: ConnectResult, start: Instant, duration: Duration) -> ReportItem {
+    fn from_connect_result(pair: ReportConnectionPair, result: ConnectResult, start: Instant, duration: Duration) -> ReportItem {
         ReportItem::Done(ReportDone::from_connect_result(pair, result, start, duration))
     }
-    fn from_io_error(pair: ReportPair, err: io::Error, start: Instant, duration: Duration) -> ReportItem {
+    fn from_io_error(pair: ReportConnectionPair, err: io::Error, start: Instant, duration: Duration) -> ReportItem {
         ReportItem::Done(ReportDone::from_io_error(pair, err, start, duration))
     }
     fn check_connect(self, tls_config: &Option<Arc<rustls::ClientConfig>>) -> ReportDone {
@@ -218,7 +260,7 @@ impl ReportItem {
 }
 
 #[derive(Clone, Debug)]
-struct ReportPair {
+struct ReportConnectionPair {
     local: HostLookup,
     peer: HostLookup,
     port: u16,
@@ -226,7 +268,7 @@ struct ReportPair {
 
 #[derive(Debug)]
 struct ReportTodo {
-    pair: ReportPair,
+    pair: ReportConnectionPair,
     sock: SocketAddr,
     timeout: Duration,
 }
@@ -283,15 +325,15 @@ impl ReportTodo {
 
 #[derive(Debug)]
 struct ReportDone {
-    pair: ReportPair,
+    pair: ReportConnectionPair,
     result: ConnectResult,
     start: Instant,
     duration: Duration,
 }
 
 impl ReportDone {
-    fn from_connect_result(pair: ReportPair, result: ConnectResult,
-                           start: Instant, duration: Duration)-> ReportDone {
+    fn from_connect_result(pair: ReportConnectionPair, result: ConnectResult,
+                           start: Instant, duration: Duration) -> ReportDone {
         match &result {
             // for open connections, replace initial guesses
             // with actual ips used
@@ -300,7 +342,7 @@ impl ReportDone {
                 peer: peer_addr,
                 tls: _tls_result,
             } => ReportDone {
-                pair: ReportPair {
+                pair: ReportConnectionPair {
                     local: HostLookup {
                         hostname: pair.local.hostname,
                         ip: local_addr.map(|x| x.ip()),
@@ -320,7 +362,7 @@ impl ReportDone {
     }
 
     // especially for errors during host lookup
-    fn from_io_error(pair: ReportPair, err: io::Error, start: Instant, duration: Duration) -> ReportDone {
+    fn from_io_error(pair: ReportConnectionPair, err: io::Error, start: Instant, duration: Duration) -> ReportDone {
         ReportDone {
             pair,
             result: ConnectResult::OtherIoError(err),
@@ -360,59 +402,20 @@ impl HasBroadcast for get_if_addrs::Interface {
     }
 }
 
-// group args host1 host2 :22 host3 :33 :44 :55
-// into [{[host1, host2], [22]}, {[host3], [33, 44, 55]}]
-fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
-    let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(Vec::new);
-    let mut dest_args = dest_matches.iter();
-    let mut dests: Vec<HostsPortsGroup> = vec![];
-    loop {
-        let dest_hosts = dest_args
-            .take_while_ref(|s| !s.starts_with(':'))
-            .cloned()
-            .collect_vec();
-        if dest_hosts.is_empty() {
-            break;
-        }
-        let mut dest_ports = dest_args
-            .take_while_ref(|s| s.starts_with(':'))
-            .flat_map(|s| -> Option<u16> {
-                let s1 = s.trim_start_matches(':');
-                let parsed = s1.parse::<u16>();
-                match parsed {
-                    Ok(x) => Some(x),
-                    Err(e) => {
-                        error!("Couldn't parse port number, ignoring {0}, {1}", s, e);
-                        None
-                    }
-                }
-            })
-            .collect_vec();
-        if dest_ports.is_empty() {
-            // default ports
-            dest_ports.extend([80, 443].iter());
-        }
-        dests.push(HostsPortsGroup {
-            hostnames: dest_hosts,
-            ports: dest_ports,
-        });
-    }
-    dests
-}
 
-// Returns a Vec to collect to_socket_addrs, which
-// returns an iterator
-fn report_host_port(
-    pair: ReportPair,
+// Returns a Vec collect to_socket_addrs
+fn collect_socket_addrs_report(
+    pair: ReportConnectionPair,
     sock_addr: net::SocketAddr,
     timeout: Duration,
 ) -> Result<Vec<ReportItem>, io::Error> {
+    // note: to_socket_addrs blocks thread
     let socket_addrs = (sock_addr.ip(), pair.port).to_socket_addrs()?;
     let mut report: Vec<ReportItem> = socket_addrs
         .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout))
         .collect();
     if report.is_empty() {
-        // should never happen, but if it does, report it
+        // may happen depending on the outcome resolving to to_socket_addrs
         report.push(ReportItem::from_connect_result(
             pair,
             ConnectResult::EmptySocketAddrs,
@@ -441,8 +444,8 @@ fn report_host(
             let socket_addr_report: Vec<ReportItem> = ports
                 .iter()
                 .map(|port| {
-                    report_host_port(
-                        ReportPair {
+                    collect_socket_addrs_report(
+                        ReportConnectionPair {
                             local: local_host_lookup.clone(),
                             peer: peer_info.clone(),
                             port: *port,
@@ -452,7 +455,7 @@ fn report_host(
                     )
                     .unwrap_or_else(|err| {
                         vec![ReportItem::from_io_error(
-                            ReportPair {
+                            ReportConnectionPair {
                                 local: local_host_lookup.clone(),
                                 peer: peer_info.clone(),
                                 port: *port,
@@ -483,7 +486,7 @@ fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, t
             report_host(local_host_lookup, host, lookup_port, &group.ports, timeout)
                 .unwrap_or_else(|err| {
                 vec![ReportItem::from_io_error(
-                    ReportPair {
+                    ReportConnectionPair {
                         local: local_host_lookup.clone(),
                         peer: HostLookup {
                             hostname: host.to_string(),
@@ -634,7 +637,7 @@ fn main() -> io::Result<()> {
         )
         .get_matches();
 
-    let dests = group_dest_args(&appmatches);
+    let dests = HostsPortsGroup::group_dest_args(&appmatches);
     let src_hostname = get_hostname();
     let mut tw = TabWriter::new(io::stdout());
 
