@@ -1,13 +1,12 @@
 # ackreport
 
-Attempt TCP connections and report on open ports.
-Compared to [nmap](https://nmap.org/), ackreport has no features but may be easier to install.
-It is meant to be a slightly more civilized "telnet test".
+ackreport is a simple tool to test TCP and TLS network and socket behavior.
+It is meant to be a more civilized "telnet test".
 
 ## Usage
 
 ackreport takes a list of destinations: hostnames and :ports.
-Arguments starting with : are interpretted as port numbers.
+Arguments starting with `:` are interpreted as port numbers.
 For hostnames that return multiple IP addresses, all addresses will be checked.
 
 ```
@@ -22,17 +21,6 @@ $ ackreport slashdot.org freshmeat.net :25 :80 :443
 
 ```
 exec: cargo run --release -- slashdot.org freshmeat.net :25 :80 :443
-```
-
-No local IP is reported for connections that are not ACKed, the `--interfaces` option
-is provided for a guess at the local IP.
-
-```
-$ ackreport -i freshmeat.net :25
-```
-
-```
-exec: cargo run --release -- -i freshmeat.net :25
 ```
 
 ackreport can attempt to negotiate a TLS connection.

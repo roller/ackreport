@@ -8,10 +8,13 @@ use std::time::{Instant, Duration};
 use std::sync::Arc;
 use duration_string::DurationString;
 use itertools::Itertools;
-use log::{debug, info, error};
+use log::{debug, info, warn, error};
 use tabwriter::TabWriter;
 use rayon::prelude::*;
 use rustls::Session;
+
+#[cfg(feature = "local_ip")]
+use local_ip_address::local_ip;
 
 // Group hosts and ports to attempt connections
 #[derive(Debug)]
@@ -95,7 +98,7 @@ enum TlsResult {
     OpenNoTLS, // aka IncompleteHandshake,
     TlsIoTimeout,
     IoErr(io::Error),
-    TlsErr(rustls::TLSError)
+    TlsErr(rustls::TLSError),
 }
 
 impl TlsResult {
@@ -165,6 +168,7 @@ enum ConnectResult {
     Closed,
     Filtered,
     EmptySocketAddrs,
+    LocalIpLookup,
     OtherIoError(io::Error),
 }
 
@@ -231,6 +235,7 @@ impl std::fmt::Display for ConnectResult {
             ConnectResult::Filtered => write!(f, "Filtered"),
             ConnectResult::EmptySocketAddrs => write!(f, "EmptySocketAddrs"),
             ConnectResult::OtherIoError(e) => write!(f, "Error: {}", e),
+            ConnectResult::LocalIpLookup => write!(f,"(local ip)"),
         }
     }
 }
@@ -375,6 +380,10 @@ impl ReportDone {
         writeln!(tw, "Local\tPeer\tPort\tTime\tResult")
     }
 
+    fn has_local_ip(&self) -> bool {
+        self.pair.local.ip.is_some()
+    }
+
     fn println<W: Write>(&self, tw: &mut TabWriter<W>) -> io::Result<()> {
         writeln!(
             tw,
@@ -383,25 +392,55 @@ impl ReportDone {
         )
     }
 }
-
-// helper to check if addr has a broadcast interface
-trait HasBroadcast {
-    fn has_broadcast(&self) -> bool;
-}
-impl HasBroadcast for get_if_addrs::IfAddr {
-    fn has_broadcast(&self) -> bool {
-        match self {
-            get_if_addrs::IfAddr::V4(i) => i.broadcast.is_some(),
-            get_if_addrs::IfAddr::V6(i) => i.broadcast.is_some(),
-        }
-    }
-}
-impl HasBroadcast for get_if_addrs::Interface {
-    fn has_broadcast(&self) -> bool {
-        self.addr.has_broadcast()
-    }
+fn local_ip_line<W: Write>(tw: &mut TabWriter<W>, host_lookup: HostLookup) -> io::Result<()> {
+    writeln!(
+        tw,
+        "{}\t\t\t\t{}",
+        host_lookup, ConnectResult::LocalIpLookup
+    )
 }
 
+#[cfg(feature = "local_ip")]
+fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::Result<()> {
+    // No local IPs?  Add ip lookups to the end
+    let local_ip = ok_or_log(local_ip(), "Could not get local ip");
+    for item in local_ip {
+        // item.println(&mut tw)?;
+        local_ip_line(tw, HostLookup {
+            hostname: src_hostname.to_string(),
+            ip: Some(item),
+        })?;
+    }
+    Ok(())
+}
+
+
+// use std to_socket_addrs to attempt
+// (this doesn't work where the local hostname is always configured
+//  to a loopback address, but has a chance to be better than nothing)
+#[cfg(not(feature = "local_ip"))]
+fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::Result<()> {
+    let src_addrs = ok_or_log(
+        (src_hostname.clone(), 0u16).to_socket_addrs(),
+        "Couldn't lookup local hostname guess");
+    info!("Local lookup: {} found {:?}", src_hostname, src_addrs);
+    let src_guess = if let Some(addrs) = src_addrs {
+        addrs
+            .map(|addr| addr.ip())
+            .filter(|ip| !ip.is_loopback())
+            .collect()
+    } else {
+        vec![]
+    };
+    for item in &src_guess {
+        // item.println(&mut tw)?;
+        local_ip_line(tw, HostLookup {
+            hostname: src_hostname.to_string(),
+            ip: Some(*item),
+        })?;
+    }
+    Ok(())
+}
 
 // Returns a Vec collect to_socket_addrs
 fn collect_socket_addrs_report(
@@ -514,37 +553,6 @@ fn get_hostname() -> String {
     }
 }
 
-fn report_interfaces<W: Write>(mut tw: &mut TabWriter<W>, src_hostname: &str) {
-    let mut host_name_ip = vec![];
-    match get_if_addrs::get_if_addrs() {
-        Ok(interfaces) => {
-            host_name_ip.extend(
-                interfaces
-                    .into_iter()
-                    .map(|i| {
-                        debug!("interface {:?}", i);
-                        i
-                    })
-                    .filter(|i| !i.is_loopback() && i.has_broadcast())
-                    .map(|i| HostLookup {
-                        hostname: src_hostname.into(),
-                        ip: Some(i.ip()),
-                    }),
-            );
-        }
-        Err(err) => {
-            error!("Couldn't get local interfaces: {}", err);
-        }
-    }
-    writeln!(&mut tw, "Local Interfaces").unwrap();
-    for i in &host_name_ip {
-        writeln!(&mut tw, "{}", i).unwrap();
-    }
-    if let Err(e) = tw.flush() {
-        error!("Couldn't flush tab writer: {}", e);
-    }
-}
-
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum TlsMode {
     NativeRoots,
@@ -559,7 +567,14 @@ fn rustls_client_config(tls_arg: Option<TlsMode>) -> Option<Arc<rustls::ClientCo
                 config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
             }
             TlsMode::NativeRoots => {
-                let cert_store = rustls_native_certs::load_native_certs().expect("Could not load native platform TLS root certs (try --tls-moz?)");
+                let cert_store = match rustls_native_certs::load_native_certs() {
+                    Ok(store) => store,
+                    Err((Some(partial), err)) => {
+                        warn!("Error loading native platform TLS root cert, using partial roots: {}", err);
+                        partial
+                    },
+                    Err((None, err)) => panic!("Could not load native platform TLS root certs (try --tls-moz?): {}", err)
+                };
                 config.root_store = cert_store;
             }
         }
@@ -613,13 +628,6 @@ fn main() -> io::Result<()> {
                 .required(true)
         )
         .arg(
-            clap::Arg::with_name("interfaces")
-                .help("Show interfaces")
-                .short("i")
-                .long("interfaces")
-                .takes_value(false)
-        )
-        .arg(
             clap::Arg::with_name("tls")
                 .help("Attempt TLS handshake with OS cert roots")
                 .long("tls")
@@ -652,10 +660,6 @@ fn main() -> io::Result<()> {
                 default_timeout
             });
 
-    if appmatches.is_present("interfaces") {
-        report_interfaces(&mut tw, &src_hostname)
-    }
-
     let tls_arg = if appmatches.is_present("tls") {
         Some(TlsMode::NativeRoots)
     } else if appmatches.is_present("tls-moz") {
@@ -674,7 +678,7 @@ fn main() -> io::Result<()> {
     }
 
     let local_host_fallback = HostLookup {
-        hostname: src_hostname,
+        hostname: src_hostname.clone(),
         ip: None,
     };
 
@@ -684,11 +688,19 @@ fn main() -> io::Result<()> {
         .flatten()
         .collect();
 
+    info!("Checking {} connections", report_todo.len());  // (RUST_LOG=info for timestamp!)
     let report_done: Vec<_> = report_todo.into_par_iter().map(|r| r.check_connect(&tls_config)).collect();
+
+    let any_local_ips = report_done.iter()
+        .any(|item| item.has_local_ip());
 
     ReportDone::header(&mut tw)?;
     for item in &report_done {
         item.println(&mut tw)?;
+    }
+    if !any_local_ips
+    {
+        local_ip_report(&mut tw, &src_hostname)?;
     }
     tw.flush()?;
 

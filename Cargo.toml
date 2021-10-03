@@ -1,6 +1,6 @@
 [package]
 name = "ackreport"
-version = "0.2.3"
+version = "0.3.0"
 authors = ["roller@gmail.com"]
 edition = "2018"
 
@@ -9,7 +9,6 @@ lto = true
 
 [dependencies]
 clap = "~2.32.0"
-get_if_addrs = "0.5.3"
 hostname = "^0.1"
 log = "0.4"
 env_logger = "0.5.11"
@@ -21,3 +20,11 @@ rustls = "0.19"
 webpki = "0.21"
 webpki-roots = "0.21"
 rustls-native-certs = "0.5"
+
+# This is optional because it doesn't build on windows cross from linux
+# https://github.com/EstebanBorai/local-ip-address/issues/16
+local-ip-address = { version = "0.4.4", optional = true }
+
+[features]
+default = ["local_ip"]
+local_ip = ["local-ip-address"]

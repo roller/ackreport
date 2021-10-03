@@ -23,6 +23,7 @@ readme:
     while (<$fh>) {
         if (/^exec: (.*)$/) {
             $out = `$1`;
+            # ugly padding to keep columns aligned
             $out =~ s/^Local.*?(?=  [^ ])/Local               /gm;
             $out =~        s/^$host \d\S*/abc101 192.168.1.101/gm;
             $out =~  s/^$host.*? (?=[^ ])/abc101                /gm;
@@ -35,6 +36,34 @@ readme:
 # build a docker image
 docker:
     docker build .
+
+# build windows target using cross
+cross_build:
+    cross build --no-default-features --release --target x86_64-pc-windows-gnu
+
+# build a windows and linux binaries via cross
+release_cross:
+    #!/bin/bash
+    # This is run on a linux environment with cargo install cross
+    # Rename binaries to include toolchain and version
+    set -xe
+    version=$(cargo run --release -- --version | awk '{ print $2 }')
+    reldir="target/release-$version"
+    mkdir -p "$reldir"
+
+    # linux
+    toolchain=x86_64-unknown-linux-gnu
+    relpath="$reldir/ackreport-$toolchain-$version"
+    cargo +stable-$toolchain build --release
+    cp target/release/ackreport "$relpath"
+    strip "$relpath"
+
+    # windows, build gnu to avoid msvcrt dep
+    toolchain=x86_64-pc-windows-gnu
+    relpath="$reldir/ackreport-$toolchain-$version.exe"
+    cross build --no-default-features --release --target x86_64-pc-windows-gnu
+    cp "target/$toolchain/release/ackreport.exe" "$relpath"
+    strip "$relpath"
 
 # build release binaries in WSL
 release_bin_wsl:
