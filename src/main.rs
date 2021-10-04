@@ -103,11 +103,9 @@ enum TlsResult {
 
 impl TlsResult {
     fn seems_ok(&self) -> bool {
-        match self {
+        matches!(self,
             TlsResult::NotChecked |
-            TlsResult::TlsOk { .. } => true,
-            _ => false,
-        }
+            TlsResult::TlsOk { .. })
     }
 }
 
@@ -404,7 +402,7 @@ fn local_ip_line<W: Write>(tw: &mut TabWriter<W>, host_lookup: HostLookup) -> io
 fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::Result<()> {
     // No local IPs?  Add ip lookups to the end
     let local_ip = ok_or_log(local_ip(), "Could not get local ip");
-    for item in local_ip {
+    if let Some(item) = local_ip {
         // item.println(&mut tw)?;
         local_ip_line(tw, HostLookup {
             hostname: src_hostname.to_string(),
@@ -619,7 +617,7 @@ fn main() -> io::Result<()> {
                 .long("timeout")
                 .required(false)
                 .takes_value(true)
-                .default_value(&default_timeout_str)
+                .default_value(default_timeout_str)
         )
         .arg(
             clap::Arg::with_name("dest")
@@ -684,7 +682,7 @@ fn main() -> io::Result<()> {
 
     let report_todo: Vec<_> = dests
         .iter()
-        .map(|group| report_hosts_ports(&local_host_fallback, &group, timeout))
+        .map(|group| report_hosts_ports(&local_host_fallback, group, timeout))
         .flatten()
         .collect();
 
