@@ -11,6 +11,11 @@ local:
 timeout:
     RUST_LOG=info cargo run --release -- --threads 1 --tls --timeout 30ms badssl.com :80 badssl.com :99 no-common-name.badssl.com :443
 
+# install into ~/.cargo/bin
+build_install:
+    cargo build --release
+    cp target/release/ackreport ~/.cargo/bin/ackreport
+
 # Overwrite README.md using README.template.md script
 readme:
     #!/usr/bin/perl
