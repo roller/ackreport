@@ -680,13 +680,15 @@ fn main() -> io::Result<()> {
         ip: None,
     };
 
+    let lookup_start = Instant::now();
     let report_todo: Vec<_> = dests
         .iter()
         .map(|group| report_hosts_ports(&local_host_fallback, group, timeout))
         .flatten()
         .collect();
+    let lookup_duration = Instant::now() - lookup_start;
 
-    info!("Checking {} connections", report_todo.len());  // (RUST_LOG=info for timestamp!)
+    info!("Found {} target peers in {:?}", report_todo.len(), lookup_duration);  // (RUST_LOG=info for timestamp!)
     let report_done: Vec<_> = report_todo.into_par_iter().map(|r| r.check_connect(&tls_config)).collect();
 
     let any_local_ips = report_done.iter()
