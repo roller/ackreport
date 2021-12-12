@@ -557,30 +557,6 @@ enum TlsMode {
     MozillaRoots,
 }
 
-fn rustls_client_config(tls_arg: Option<TlsMode>) -> Option<Arc<rustls::ClientConfig>> {
-    if let Some(tls_mode) = tls_arg {
-        let mut config = rustls::ClientConfig::new();
-        match tls_mode {
-            TlsMode::MozillaRoots => {
-                config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-            }
-            TlsMode::NativeRoots => {
-                let cert_store = match rustls_native_certs::load_native_certs() {
-                    Ok(store) => store,
-                    Err((Some(partial), err)) => {
-                        warn!("Error loading native platform TLS root cert, using partial roots: {}", err);
-                        partial
-                    },
-                    Err((None, err)) => panic!("Could not load native platform TLS root certs (try --tls-moz?): {}", err)
-                };
-                config.root_store = cert_store;
-            }
-        }
-        Some(Arc::new(config))
-    } else {
-        None
-    }
-}
 
 fn report_exit_code(report: &[ReportDone]) -> i32 {
     if report
@@ -592,98 +568,150 @@ fn report_exit_code(report: &[ReportDone]) -> i32 {
     }
 }
 
-fn main() -> io::Result<()> {
-    env_logger::init();
-    const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
-    let default_timeout_str = "7s";
-    let default_timeout: Duration = DurationString::from_string(default_timeout_str.to_string())
-        .unwrap().into();
+struct AckReportConfig {
+    targets: Vec<HostsPortsGroup>,
+    timeout: Duration,
+    threads: Option<String>,
+    tls_mode: Option<TlsMode>,
+}
 
-    let appmatches = clap::App::new("ackreport")
-        .version(VERSION.unwrap_or("v0"))
-        .arg(
-            clap::Arg::with_name("threads")
-                .help("Parallel connection attempts (default 10)")
-                .multiple(false)
-                .long("threads")
-                .required(false)
-                .takes_value(true)
-                .env("RAYON_NUM_THREADS")
-        )
-        .arg(
-            clap::Arg::with_name("timeout")
-                .help("Connection timeout (eg 10s or 500ms)")
-                .short("t")
-                .long("timeout")
-                .required(false)
-                .takes_value(true)
-                .default_value(default_timeout_str)
-        )
-        .arg(
-            clap::Arg::with_name("dest")
-                .help("Destination hostnames and :ports")
-                .multiple(true)
-                .required(true)
-        )
-        .arg(
-            clap::Arg::with_name("tls")
-                .help("Attempt TLS handshake with OS cert roots")
-                .long("tls")
-                .alias("tls-native-roots")
-                .takes_value(false)
-        )
-        .arg(
-            clap::Arg::with_name("tls-moz")
-                .help("Attempt TLS handshake with mozilla cert roots")
-                .long("tls-moz")
-                .alias("tls-moz-roots")
-                .alias("tls-mozilla-roots")
-                .takes_value(false)
-                .conflicts_with("tls")
-        )
-        .get_matches();
+impl AckReportConfig {
+    fn new() -> AckReportConfig {
+        const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
+        let default_timeout_str = "7s";
+        let default_timeout: Duration = DurationString::from_string(default_timeout_str.to_string())
+            .unwrap().into();
+        let matches = clap::App::new("ackreport")
+            .version(VERSION.unwrap_or("v0"))
+            .arg(
+                clap::Arg::with_name("threads")
+                    .help("Parallel connection attempts (default 10)")
+                    .multiple(false)
+                    .long("threads")
+                    .required(false)
+                    .takes_value(true)
+                    .env("RAYON_NUM_THREADS")
+            )
+            .arg(
+                clap::Arg::with_name("timeout")
+                    .help("Connection timeout (eg 10s or 500ms)")
+                    .short("t")
+                    .long("timeout")
+                    .required(false)
+                    .takes_value(true)
+                    .default_value(default_timeout_str)
+            )
+            .arg(
+                clap::Arg::with_name("dest")
+                    .help("Destination hostnames and :ports")
+                    .multiple(true)
+                    .required(true)
+            )
+            .arg(
+                clap::Arg::with_name("tls")
+                    .help("Attempt TLS handshake with OS cert roots")
+                    .long("tls")
+                    .alias("tls-native-roots")
+                    .takes_value(false)
+            )
+            .arg(
+                clap::Arg::with_name("tls-moz")
+                    .help("Attempt TLS handshake with mozilla cert roots")
+                    .long("tls-moz")
+                    .alias("tls-moz-roots")
+                    .alias("tls-mozilla-roots")
+                    .takes_value(false)
+                    .conflicts_with("tls")
+            )
+            .get_matches();
+            let timeout: Duration =
+                DurationString::from_string(
+                    matches.value_of("timeout")
+                        .expect("timeout has default, this must be present")
+                        .to_string())
+                    .map(|ds| ds.into())
+                    .unwrap_or_else(|e| {
+                        error!("Could not parse timeout arg: {}; using default {:?}", e, default_timeout);
+                        default_timeout
+                    });
 
-    let dests = HostsPortsGroup::group_dest_args(&appmatches);
-    let src_hostname = get_hostname();
-    let mut tw = TabWriter::new(io::stdout());
+            let tls_mode = if matches.is_present("tls") {
+                Some(TlsMode::NativeRoots)
+            } else if matches.is_present("tls-moz") {
+                Some(TlsMode::MozillaRoots)
+            } else {
+                None
+            };
+        let targets = HostsPortsGroup::group_dest_args(&matches);
+        // let threads_str: Option<&str> = matches.value_of("threads").unwrap_or(None);
+        let threads_str: Option<&str> = matches.value_of("threads");
+        let threads = threads_str.map(str::to_string);
 
-    let timeout: Duration =
-        DurationString::from_string(
-            appmatches.value_of("timeout")
-                .expect("timeout has default, this must be present")
-                .to_string())
-            .map(|ds| ds.into())
-            .unwrap_or_else(|e| {
-                error!("Could not parse timeout arg: {}; using default {:?}", e, default_timeout);
-                default_timeout
-            });
-
-    let tls_arg = if appmatches.is_present("tls") {
-        Some(TlsMode::NativeRoots)
-    } else if appmatches.is_present("tls-moz") {
-        Some(TlsMode::MozillaRoots)
-    } else {
-        None
-    };
-    let tls_config = rustls_client_config(tls_arg);
-
-    let arg_threads = appmatches.value_of("threads");
-    if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || arg_threads.is_some() {
-        env::set_var(
-            "RAYON_NUM_THREADS",
-            appmatches.value_of("threads").unwrap_or("10"),
-        );
+        AckReportConfig {
+            targets,
+            tls_mode,
+            timeout,
+            threads
+        }
     }
 
+    fn set_rayon_env(&self) {
+        if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || self.threads.is_some() {
+            env::set_var(
+                "RAYON_NUM_THREADS",
+                self.threads.as_ref().unwrap_or(&"10".to_string())
+            );
+        }
+    }
+
+    fn rustls_client_config(&self) -> Option<Arc<rustls::ClientConfig>> {
+        AckReportConfig::rustls_client_config_from_mode(self.tls_mode)
+    }
+
+    fn rustls_client_config_from_mode(tls_arg: Option<TlsMode>) -> Option<Arc<rustls::ClientConfig>> {
+        if let Some(tls_mode) = tls_arg {
+            let mut config = rustls::ClientConfig::new();
+            match tls_mode {
+                TlsMode::MozillaRoots => {
+                    config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+                }
+                TlsMode::NativeRoots => {
+                    let cert_store = match rustls_native_certs::load_native_certs() {
+                        Ok(store) => store,
+                        Err((Some(partial), err)) => {
+                            warn!("Error loading native platform TLS root cert, using partial roots: {}", err);
+                            partial
+                        },
+                        Err((None, err)) => panic!("Could not load native platform TLS root certs (try --tls-moz?): {}", err)
+                    };
+                    config.root_store = cert_store;
+                }
+            }
+            Some(Arc::new(config))
+        } else {
+            None
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    env_logger::init();
+
+    let config = AckReportConfig::new();
+    let tls_config = config.rustls_client_config();
+    config.set_rayon_env();
+
+    let src_hostname = get_hostname();
+    // lookup
     let local_host_fallback = HostLookup {
         hostname: src_hostname.clone(),
         ip: None,
     };
 
     let lookup_start = Instant::now();
-    let report_todo: Vec<_> = dests
+    let report_todo: Vec<_> = config.targets
         .iter()
-        .map(|group| report_hosts_ports(&local_host_fallback, group, timeout))
+        .map(|group| report_hosts_ports(&local_host_fallback, group, config.timeout))
         .flatten()
         .collect();
     let lookup_duration = Instant::now() - lookup_start;
@@ -694,6 +722,7 @@ fn main() -> io::Result<()> {
     let any_local_ips = report_done.iter()
         .any(|item| item.has_local_ip());
 
+    let mut tw = TabWriter::new(io::stdout());
     ReportDone::header(&mut tw)?;
     for item in &report_done {
         item.println(&mut tw)?;
