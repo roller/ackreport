@@ -1,20 +1,22 @@
-use std::env;
+use std::convert::TryFrom;
 use std::io;
 use std::io::Write;
+use std::str::FromStr;
 use std::net;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Instant, Duration};
 
-use std::sync::Arc;
 use duration_string::DurationString;
 use itertools::Itertools;
 use log::{debug, info, warn, error};
 use tabwriter::TabWriter;
-use rayon::prelude::*;
-use rustls::Session;
 
 #[cfg(feature = "local_ip")]
 use local_ip_address::local_ip;
+use tokio::io::AsyncWriteExt;
+use tokio_rustls::rustls::OwnedTrustAnchor;
+use tokio_rustls::rustls;
 
 // Group hosts and ports to attempt connections
 #[derive(Debug)]
@@ -63,6 +65,11 @@ impl HostsPortsGroup {
         }
         dests
     }
+
+    // first port in group is used for host addr lookup
+    fn lookup_port(ports: &[u16]) -> u16 {
+       ports.get(0).map_or(443, |p| *p)
+    }
 }
 
 // Hostnames and results of an DNS/host lookup
@@ -92,13 +99,13 @@ impl std::fmt::Display for HostLookup {
 enum TlsResult {
     NotChecked,
     TlsOk {
-        protocol_version: rustls::ProtocolVersion,
+        protocol_version: tokio_rustls::rustls::ProtocolVersion,
     },
     InvalidDNSNameError,
     OpenNoTLS, // aka IncompleteHandshake,
     TlsIoTimeout,
     IoErr(io::Error),
-    TlsErr(rustls::TLSError),
+    TlsErr(tokio_rustls::rustls::Error),
 }
 
 impl TlsResult {
@@ -114,9 +121,9 @@ impl From<io::Error> for TlsResult {
         let kind = error.kind();
         match kind {
             io::ErrorKind::InvalidData => {
-                let tls_error = error.get_ref().map(|r| r.downcast_ref::<rustls::TLSError>() ).flatten();
+                let tls_error = error.get_ref().map(|r| r.downcast_ref::<rustls::Error>() ).flatten();
                 match tls_error {
-                    Some(rustls::TLSError::CorruptMessage) => TlsResult::OpenNoTLS,
+                    Some(rustls::Error::CorruptMessage) => TlsResult::OpenNoTLS,
                     Some(t) => TlsResult::from(t),
                     None => TlsResult::IoErr(error)
                 }
@@ -132,15 +139,9 @@ impl From<io::Error> for TlsResult {
     }
 }
 
-impl From<&rustls::TLSError> for TlsResult {
-    fn from(error: &rustls::TLSError) -> Self {
+impl From<&tokio_rustls::rustls::Error> for TlsResult {
+    fn from(error: &tokio_rustls::rustls::Error) -> Self {
         TlsResult::TlsErr(error.clone())
-    }
-}
-
-impl From<webpki::InvalidDNSNameError> for TlsResult {
-    fn from(_error: webpki::InvalidDNSNameError) -> Self {
-        TlsResult::InvalidDNSNameError
     }
 }
 
@@ -157,16 +158,21 @@ impl std::fmt::Display for TlsResult {
 }
 
 #[derive(Debug)]
+struct OpenConnectResult {
+    local: Option<net::SocketAddr>,
+    peer: Option<net::SocketAddr>,
+    tls: TlsResult,
+}
+
+#[derive(Debug)]
 enum ConnectResult {
-    Open {
-        local: Option<net::SocketAddr>,
-        peer: Option<net::SocketAddr>,
-        tls: TlsResult,
-    },
+    Open(OpenConnectResult),
     Closed,
+    LookupTimeout,
     Filtered,
     EmptySocketAddrs,
     LocalIpLookup,
+    LookupIoError(io::Error),
     OtherIoError(io::Error),
 }
 
@@ -183,27 +189,25 @@ fn ok_or_log<O,E>(res: Result<O,E>, msg: &str) -> Option<O>
     }
 }
 
-impl ConnectResult {
+impl OpenConnectResult {
     fn from_open_ips(
         local_sock: std::io::Result<net::SocketAddr>,
         peer_sock: std::io::Result<net::SocketAddr>,
         tls: TlsResult
-    ) -> ConnectResult {
+    ) -> OpenConnectResult {
         let local = ok_or_log(local_sock, "TCP stream couldn't get local ip");
         let peer = ok_or_log(peer_sock, "TCP stream couldn't get peer ip");
-        ConnectResult::Open { local, peer, tls }
+        OpenConnectResult { local, peer, tls }
     }
+}
 
-    fn from_result(tcp_result: io::Result<net::TcpStream>) -> ConnectResult {
-        match tcp_result {
-            Ok(stream) => {
-                Self::from_open_ips(stream.local_addr(), stream.peer_addr(), TlsResult::NotChecked)
-            }
-            Err(e) => match e.kind() {
-                io::ErrorKind::TimedOut => ConnectResult::Filtered,
-                io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
-                _ => ConnectResult::OtherIoError(e),
-            },
+impl ConnectResult {
+
+    fn from_io_error(io_error: io::Error) -> ConnectResult {
+        match io_error.kind() {
+            io::ErrorKind::TimedOut => ConnectResult::Filtered,
+            io::ErrorKind::ConnectionRefused => ConnectResult::Closed,
+            _ => ConnectResult::OtherIoError(io_error),
         }
     }
 
@@ -211,57 +215,33 @@ impl ConnectResult {
     // and any TLS handshake succeeded
     fn seems_ok(&self) -> bool {
         match self {
-            ConnectResult::Open { tls, .. } => tls.seems_ok(),
+            ConnectResult::Open(open_result) => open_result.tls.seems_ok(),
             _ => false
         }
-    }
-}
-
-impl From<io::Result<net::TcpStream>> for ConnectResult {
-    // assumed to be only used when Tls is not checked
-    fn from(tcp_result: io::Result<net::TcpStream>) -> Self {
-        Self::from_result(tcp_result)
     }
 }
 
 impl std::fmt::Display for ConnectResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectResult::Open { tls: TlsResult::NotChecked, .. } => write!(f, "Open"),
-            ConnectResult::Open { tls: tls_result, .. } => tls_result.fmt(f),
+            ConnectResult::Open(OpenConnectResult {
+                                    tls: TlsResult::NotChecked,
+                                    ..}) => write!(f, "Open"),
+            ConnectResult::Open(OpenConnectResult {
+                                    tls: tls_result,
+                                    .. }) => tls_result.fmt(f),
             ConnectResult::Closed => write!(f, "Closed"),
             ConnectResult::Filtered => write!(f, "Filtered"),
             ConnectResult::EmptySocketAddrs => write!(f, "EmptySocketAddrs"),
+            ConnectResult::LookupTimeout => write!(f, "Lookup: Timeout"),
+            ConnectResult::LookupIoError(e) => write!(f, "Lookup: {}", e),
             ConnectResult::OtherIoError(e) => write!(f, "Error: {}", e),
             ConnectResult::LocalIpLookup => write!(f,"(local ip)"),
         }
     }
 }
 
-#[derive(Debug)]
-enum ReportItem {
-    Todo(ReportTodo),
-    Done(ReportDone),
-}
-
-impl ReportItem {
-    fn from_sock(pair: ReportConnectionPair, sock: SocketAddr, timeout: Duration) -> ReportItem {
-        ReportItem::Todo(ReportTodo { pair, sock, timeout })
-    }
-    fn from_connect_result(pair: ReportConnectionPair, result: ConnectResult, start: Instant, duration: Duration) -> ReportItem {
-        ReportItem::Done(ReportDone::from_connect_result(pair, result, start, duration))
-    }
-    fn from_io_error(pair: ReportConnectionPair, err: io::Error, start: Instant, duration: Duration) -> ReportItem {
-        ReportItem::Done(ReportDone::from_io_error(pair, err, start, duration))
-    }
-    fn check_connect(self, tls_config: &Option<Arc<rustls::ClientConfig>>) -> ReportDone {
-        match self {
-            ReportItem::Done(done) => done,
-            ReportItem::Todo(todo) => todo.check_connect(tls_config),
-        }
-    }
-}
-
+// misnamed, the port makes it more like a triple!
 #[derive(Clone, Debug)]
 struct ReportConnectionPair {
     local: HostLookup,
@@ -270,89 +250,31 @@ struct ReportConnectionPair {
 }
 
 #[derive(Debug)]
-struct ReportTodo {
-    pair: ReportConnectionPair,
-    sock: SocketAddr,
-    timeout: Duration,
-}
-
-impl ReportTodo {
-
-    fn check_tls(self: &ReportTodo, stream: &mut net::TcpStream, timeout: Duration, tls_config: &Arc<rustls::ClientConfig>) -> Result<TlsResult,TlsResult> {
-        stream.set_write_timeout(Some(timeout))?;
-        stream.set_read_timeout(Some(timeout))?;
-        let dns_name = &self.pair.peer.hostname;
-        let dns_ref = webpki::DNSNameRef::try_from_ascii_str(dns_name)?;
-        let mut client = rustls::ClientSession::new(tls_config, dns_ref);
-
-        let completed = client.complete_io(stream);
-        debug!("completed tls io: {:?}", completed);
-        completed?;
-        let ciphersuite = client.get_negotiated_ciphersuite();
-        let protoversion = client.get_protocol_version();
-        info!("tls {}: ciphersuite: {:?}, proto {:?}", dns_name, ciphersuite, protoversion);
-
-        client.send_close_notify();
-        // finishing close notify is not considered a reportable error
-        let _ = client.complete_io(stream);
-
-        Ok(TlsResult::TlsOk {
-            protocol_version: client.get_protocol_version().unwrap_or(rustls::ProtocolVersion::Unknown(0))
-        })
-    }
-
-    fn check_connect(self: ReportTodo, tls_config: &Option<Arc<rustls::ClientConfig>>) -> ReportDone {
-        let start = Instant::now();
-        let t = net::TcpStream::connect_timeout(
-            &self.sock, self.timeout);
-        let mut duration = Instant::now() - start;
-        debug!("tcp connect addr {:?} returned {:?} in {:?}", self.sock, t, duration);
-        // watch out for panic in Sub
-        let next_timeout = if self.timeout > duration { self.timeout - duration } else { Duration::from_millis(0) };
-        let result = if let Ok(mut stream) = t {
-            let local = stream.local_addr();
-            let peer = stream.peer_addr();
-            let mut tls_result = TlsResult::NotChecked;
-            if let Some(tls_config) = tls_config {
-                tls_result = self.check_tls(&mut stream, next_timeout, tls_config)
-                    .unwrap_or_else(|e| e);
-                duration = Instant::now() - start;
-            }
-            ConnectResult::from_open_ips(local, peer, tls_result)
-        } else {
-            ConnectResult::from_result(t)
-        };
-        ReportDone::from_connect_result(self.pair, result, start, duration)
-    }
-}
-
-#[derive(Debug)]
 struct ReportDone {
     pair: ReportConnectionPair,
     result: ConnectResult,
+    #[allow(dead_code)]
+    // Considering moving to Instants rather than Duration
     start: Instant,
     duration: Duration,
 }
 
 impl ReportDone {
+    // Q: Should this be a method on ReportDone?
     fn from_connect_result(pair: ReportConnectionPair, result: ConnectResult,
                            start: Instant, duration: Duration) -> ReportDone {
         match &result {
             // for open connections, replace initial guesses
             // with actual ips used
-            ConnectResult::Open {
-                local: local_addr,
-                peer: peer_addr,
-                tls: _tls_result,
-            } => ReportDone {
+            ConnectResult::Open (open_result) => ReportDone {
                 pair: ReportConnectionPair {
                     local: HostLookup {
                         hostname: pair.local.hostname,
-                        ip: local_addr.map(|x| x.ip()),
+                        ip: open_result.local.map(|x| x.ip()),
                     },
                     peer: HostLookup {
                         hostname: pair.peer.hostname,
-                        ip: peer_addr.map(|x| x.ip()),
+                        ip: open_result.peer.map(|x| x.ip()),
                     },
                     port: pair.port,
                 },
@@ -361,16 +283,6 @@ impl ReportDone {
                 duration,
             },
             _ => ReportDone { pair, result, start, duration },
-        }
-    }
-
-    // especially for errors during host lookup
-    fn from_io_error(pair: ReportConnectionPair, err: io::Error, start: Instant, duration: Duration) -> ReportDone {
-        ReportDone {
-            pair,
-            result: ConnectResult::OtherIoError(err),
-            start,
-            duration,
         }
     }
 
@@ -412,7 +324,6 @@ fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::R
     Ok(())
 }
 
-
 // use std to_socket_addrs to attempt
 // (this doesn't work where the local hostname is always configured
 //  to a loopback address, but has a chance to be better than nothing)
@@ -438,107 +349,6 @@ fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::R
         })?;
     }
     Ok(())
-}
-
-// Returns a Vec collect to_socket_addrs
-fn collect_socket_addrs_report(
-    pair: ReportConnectionPair,
-    sock_addr: net::SocketAddr,
-    timeout: Duration,
-) -> Result<Vec<ReportItem>, io::Error> {
-    // note: to_socket_addrs blocks thread
-    let socket_addrs = (sock_addr.ip(), pair.port).to_socket_addrs()?;
-    let mut report: Vec<ReportItem> = socket_addrs
-        .map(|sock| ReportItem::from_sock(pair.clone(), sock, timeout))
-        .collect();
-    if report.is_empty() {
-        // may happen depending on the outcome resolving to to_socket_addrs
-        report.push(ReportItem::from_connect_result(
-            pair,
-            ConnectResult::EmptySocketAddrs,
-            Instant::now(),
-            Duration::from_millis(0)
-        ))
-    }
-    Ok(report)
-}
-
-fn report_host(
-    local_host_lookup: &HostLookup,
-    host: &str,
-    lookup_port: u16,
-    ports: &[u16],
-    timeout: Duration,
-) -> Result<Vec<ReportItem>, io::Error> {
-    let socket_addrs = (host, lookup_port).to_socket_addrs()?;
-    let host_report: Vec<_> = socket_addrs
-        .map(|s| {
-            let peer_info = HostLookup {
-                hostname: host.to_string(),
-                ip: Some(s.ip()),
-            };
-
-            let socket_addr_report: Vec<ReportItem> = ports
-                .iter()
-                .map(|port| {
-                    collect_socket_addrs_report(
-                        ReportConnectionPair {
-                            local: local_host_lookup.clone(),
-                            peer: peer_info.clone(),
-                            port: *port,
-                        },
-                        s,
-                        timeout,
-                    )
-                    .unwrap_or_else(|err| {
-                        vec![ReportItem::from_io_error(
-                            ReportConnectionPair {
-                                local: local_host_lookup.clone(),
-                                peer: peer_info.clone(),
-                                port: *port,
-                            },
-                            err,
-                            Instant::now(),
-                            Duration::from_millis(0),
-                        )]
-                    })
-                })
-                .flatten()
-                .collect();
-            socket_addr_report
-        })
-        .flatten()
-        .collect();
-    Ok(host_report)
-}
-
-fn report_hosts_ports(local_host_lookup: &HostLookup, group: &HostsPortsGroup, timeout: Duration) -> Vec<ReportItem> {
-    // assume that any port will result in the same lookup,
-    // so use the first port just to find the dest ip
-    let lookup_port = group.ports.get(0).map_or(443, |p| *p);
-    group
-        .hostnames
-        .iter()
-        .map(|host| {
-            report_host(local_host_lookup, host, lookup_port, &group.ports, timeout)
-                .unwrap_or_else(|err| {
-                vec![ReportItem::from_io_error(
-                    ReportConnectionPair {
-                        local: local_host_lookup.clone(),
-                        peer: HostLookup {
-                            hostname: host.to_string(),
-                            ip: None,
-                        },
-                        port: lookup_port,
-                    },
-                    err,
-                    Instant::now(),
-                    Duration::from_millis(0),
-                )]
-            })
-        })
-        .flatten()
-        .collect()
 }
 
 fn get_hostname() -> String {
@@ -568,29 +378,34 @@ fn report_exit_code(report: &[ReportDone]) -> i32 {
     }
 }
 
+const DEFAULT_CONCURRENCY_LIMIT: usize = 10;
+
+// startup config
 struct AckReportConfig {
     targets: Vec<HostsPortsGroup>,
     timeout: Duration,
+    // rayon uses env strings for config
     threads: Option<String>,
-    tls_mode: Option<TlsMode>,
+    tls_client_config: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
 }
 
 impl AckReportConfig {
     fn new() -> AckReportConfig {
         const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
         let default_timeout_str = "7s";
+        let default_concurrency_str = "10";
         let default_timeout: Duration = DurationString::from_string(default_timeout_str.to_string())
             .unwrap().into();
         let matches = clap::App::new("ackreport")
             .version(VERSION.unwrap_or("v0"))
             .arg(
                 clap::Arg::with_name("threads")
-                    .help("Parallel connection attempts (default 10)")
+                    .help("Parallel connection attempts")
                     .multiple(false)
                     .long("threads")
                     .required(false)
                     .takes_value(true)
-                    .env("RAYON_NUM_THREADS")
+                    .default_value(default_concurrency_str)
             )
             .arg(
                 clap::Arg::with_name("timeout")
@@ -635,89 +450,339 @@ impl AckReportConfig {
                         default_timeout
                     });
 
-            let tls_mode = if matches.is_present("tls") {
-                Some(TlsMode::NativeRoots)
-            } else if matches.is_present("tls-moz") {
-                Some(TlsMode::MozillaRoots)
-            } else {
-                None
-            };
-        let targets = HostsPortsGroup::group_dest_args(&matches);
-        // let threads_str: Option<&str> = matches.value_of("threads").unwrap_or(None);
+        let tls_mode = if matches.is_present("tls") {
+            Some(TlsMode::NativeRoots)
+        } else if matches.is_present("tls-moz") {
+            Some(TlsMode::MozillaRoots)
+        } else {
+            None
+        };
+        let tls_client_config = AckReportConfig::rustls_client_config_from_mode(tls_mode);
+
         let threads_str: Option<&str> = matches.value_of("threads");
         let threads = threads_str.map(str::to_string);
 
+        let targets = HostsPortsGroup::group_dest_args(&matches);
+
         AckReportConfig {
             targets,
-            tls_mode,
             timeout,
-            threads
+            threads,
+            tls_client_config,
         }
     }
 
-    fn set_rayon_env(&self) {
-        if Err(env::VarError::NotPresent) == env::var("RAYON_NUM_THREADS") || self.threads.is_some() {
-            env::set_var(
-                "RAYON_NUM_THREADS",
-                self.threads.as_ref().unwrap_or(&"10".to_string())
-            );
-        }
+    fn concurrency_limit(&self) -> usize {
+        let threads = if let Some(s) = &self.threads {
+            ok_or_log(usize::from_str(s), "Could not parse threads arg")
+        } else {
+            None
+        };
+        threads.unwrap_or(DEFAULT_CONCURRENCY_LIMIT)
     }
 
-    fn rustls_client_config(&self) -> Option<Arc<rustls::ClientConfig>> {
-        AckReportConfig::rustls_client_config_from_mode(self.tls_mode)
+    // Convert webpki roots
+    fn webpki_roots_cert_store() -> tokio_rustls::rustls::RootCertStore
+    {
+        let mut cert_store = tokio_rustls::rustls::RootCertStore::empty();
+        let trust_anchors = webpki_roots::TLS_SERVER_ROOTS.0.iter()
+            .map(|anchor| {
+                OwnedTrustAnchor::from_subject_spki_name_constraints(
+                    anchor.subject,
+                    anchor.spki,
+                    anchor.name_constraints
+                )
+            });
+        cert_store.add_server_trust_anchors(trust_anchors);
+        cert_store
     }
 
-    fn rustls_client_config_from_mode(tls_arg: Option<TlsMode>) -> Option<Arc<rustls::ClientConfig>> {
+    fn rustls_client_config_from_mode(tls_arg: Option<TlsMode>) -> Option<Arc<tokio_rustls::rustls::ClientConfig>> {
         if let Some(tls_mode) = tls_arg {
-            let mut config = rustls::ClientConfig::new();
-            match tls_mode {
+            let builder_wants_verifier = tokio_rustls::rustls::ClientConfig::builder()
+                .with_safe_defaults();
+
+            let cert_store: tokio_rustls::rustls::RootCertStore = match tls_mode {
                 TlsMode::MozillaRoots => {
-                    config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+                    Self::webpki_roots_cert_store()
                 }
                 TlsMode::NativeRoots => {
-                    let cert_store = match rustls_native_certs::load_native_certs() {
+                    let certs = match rustls_native_certs::load_native_certs() {
                         Ok(store) => store,
-                        Err((Some(partial), err)) => {
-                            warn!("Error loading native platform TLS root cert, using partial roots: {}", err);
-                            partial
-                        },
-                        Err((None, err)) => panic!("Could not load native platform TLS root certs (try --tls-moz?): {}", err)
+                        Err(err) => panic!("Could not load native platform TLS root certs (try --tls-moz?): {}", err)
                     };
-                    config.root_store = cert_store;
+                    // config.root_store = cert_store;
+                    let mut new_store = tokio_rustls::rustls::RootCertStore::empty();
+                    for cert in certs.into_iter() {
+                        let res = new_store.add(&tokio_rustls::rustls::Certificate(cert.0));
+                        ok_or_log(res, "Couldn't load native cert");
+                    }
+                    new_store
                 }
-            }
-            Some(Arc::new(config))
+            };
+            let builder2 = builder_wants_verifier.with_root_certificates(cert_store);
+            let builder3 = builder2.with_no_client_auth();
+            Some(Arc::new(builder3))
         } else {
             None
         }
     }
 }
 
-fn main() -> io::Result<()> {
+struct AckRunnerState {
+    config: AckReportConfig,
+    concurrency_limit: tokio::sync::Semaphore,
+    local_host_fallback: HostLookup,
+}
+
+#[derive(Clone)]
+struct AckRunner(Arc<AckRunnerState>);
+
+impl AckRunner {
+    fn new(config: AckReportConfig) -> AckRunner {
+        let concurrency_limit = tokio::sync::Semaphore::new(config.concurrency_limit());
+        let src_hostname = get_hostname();
+        let local_host_fallback = HostLookup {
+            hostname: src_hostname,
+            ip: None,
+        };
+        AckRunner(
+            std::sync::Arc::new(
+                AckRunnerState {
+                    config,
+                    concurrency_limit,
+                    local_host_fallback
+                }
+            )
+        )
+    }
+
+    async fn run_report_tls(
+        &self,
+        mut open_result: OpenConnectResult,
+        pair: ReportConnectionPair,
+        stream: tokio::net::TcpStream,
+        start: Instant,
+        tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> ReportDone
+    {
+        let dns_name = &pair.peer.hostname;
+        // let dns_ref_result = webpki::DnsNameRef::try_from_ascii_str(dns_name);
+        let server_name_result = tokio_rustls::rustls::ServerName::try_from(dns_name.as_ref());
+        let server_name = match server_name_result {
+            Err(invalid_dns) => {
+                open_result.tls = TlsResult::InvalidDNSNameError;
+                let duration = Instant::now() - start;
+                let result = ConnectResult::Open(open_result);
+                warn!("{}: invalid DNS name {:?}", dns_name, invalid_dns);
+                return ReportDone { pair, result, start, duration };
+            }
+            Ok(server_name) => server_name
+        };
+        let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
+        let connect = connector.connect(server_name, stream);
+        let tls_result = tokio::time::timeout(
+            self.0.config.timeout,
+            connect
+        ).await;
+        open_result.tls = match tls_result {
+            Err(_) => TlsResult::TlsIoTimeout,
+            Ok(Err(io_err)) => TlsResult::from(io_err),
+            Ok(Ok(mut tls_stream)) => {
+                let ciphersuite = tls_stream.get_ref().1.negotiated_cipher_suite();
+                let protoversion = tls_stream.get_ref().1.protocol_version();
+                info!("tls {}: ciphersuite: {:?}, proto {:?}", dns_name, ciphersuite, protoversion);
+                // note: no timeout on shutdown
+                let _ = tls_stream.shutdown().await;
+                TlsResult::TlsOk {
+                    protocol_version: protoversion.unwrap_or(rustls::ProtocolVersion::Unknown(0))
+                }
+            }
+        };
+        let duration = Instant::now() - start;
+        let result = ConnectResult::Open(open_result);
+        ReportDone::from_connect_result(pair, result, start, duration)
+    }
+
+    async fn run_report_stream(
+        &self,
+        pair: ReportConnectionPair,
+        addr: &SocketAddr,
+        stream: tokio::net::TcpStream,
+        start: Instant,
+    ) -> ReportDone
+    {
+        let open_result = OpenConnectResult::from_open_ips(
+            stream.local_addr(),
+            stream.peer_addr(),
+            TlsResult::NotChecked
+        );
+        let time_done = Instant::now();
+        let duration = time_done - start;
+        debug!("tcp connect addr {:?} returned {:?} in {:?}", addr, stream, duration);
+        if let Some(tls_config) = &self.0.config.tls_client_config {
+            self.run_report_tls(open_result, pair, stream, start, tls_config.clone()).await
+        } else {
+            let result = ConnectResult::Open(open_result);
+            ReportDone::from_connect_result(pair, result, start, duration)
+        }
+    }
+
+    async fn run_report_addr(
+        self,
+        peer: HostLookup,
+        mut host_addr: SocketAddr,
+        port: u16,
+    ) -> ReportDone
+    {
+        host_addr.set_port(port);
+        let _permit = self.0.concurrency_limit.acquire().await.unwrap();
+        let pair = ReportConnectionPair {
+            local: self.0.local_host_fallback.clone(),
+            peer: peer.clone(),
+            port,
+        };
+        let start = Instant::now();
+        let result = tokio::time::timeout(
+            self.0.config.timeout, tokio::net::TcpStream::connect(host_addr),
+        ).await;
+        let time_connect = Instant::now();
+        match result {
+            Ok(Ok(stream)) => {
+                self.run_report_stream(
+                    pair, &host_addr, stream, start).await
+            }
+            Ok(Err(io_error)) => {
+                ReportDone::from_connect_result(
+                    pair, ConnectResult::from_io_error(io_error), start, time_connect - start)
+            }
+            Err(_) => {
+                ReportDone::from_connect_result(
+                    pair, ConnectResult::Filtered, start, time_connect - start)
+            }
+        }
+    }
+
+    async fn run_report_target_name(
+        self,
+        target_host: String,
+        target_ports: Vec<u16>,
+    ) -> Vec<ReportDone>
+    {
+        let start: Instant;
+        let lookup_port = HostsPortsGroup::lookup_port(&target_ports);
+        let target_host_str: &str = &target_host;
+        let mut reports = vec![];
+        let mut tasks = vec![];
+        let addr_result = {
+            let _permit = self.0.concurrency_limit.acquire().await.unwrap();
+            start = Instant::now();
+            tokio::time::timeout(
+                self.0.config.timeout,
+                tokio::net::lookup_host((target_host_str, lookup_port))
+            ).await
+        };
+        let time_lookup = Instant::now();
+        let no_ip_peer = HostLookup {
+            hostname: target_host.to_string(),
+            ip: None
+        };
+        let pair = ReportConnectionPair {
+            local: self.0.local_host_fallback.clone(),
+            peer: no_ip_peer.clone(),
+            port: lookup_port,
+        };
+        match addr_result {
+            Ok(Ok(addrs)) => {
+                let mut any_addrs = false;
+                for host_addr in addrs {
+                    any_addrs = true;
+                    let target_ports = target_ports.clone();
+                    for port in target_ports {
+                        let clone = self.clone();
+                        let peer = HostLookup {
+                            hostname: no_ip_peer.hostname.clone(),
+                            ip: Some(host_addr.ip()),
+                        };
+                        tasks.push(tokio::spawn(async move {
+                            clone.run_report_addr(peer, host_addr, port).await
+                        }));
+                    }
+                }
+                if !any_addrs {
+                    reports.push(ReportDone::from_connect_result(
+                        pair,
+                        ConnectResult::EmptySocketAddrs,
+                            start,
+                        time_lookup - start
+                    ));
+                }
+            }
+            Ok(Err(io_error)) => {
+                reports.push(ReportDone::from_connect_result(
+                    pair,
+                    ConnectResult::LookupIoError(io_error),
+                    start,
+                    time_lookup - start));
+
+            }
+            Err(_) => {
+                reports.push(ReportDone::from_connect_result(
+                    pair,
+                    ConnectResult::LookupTimeout,
+                    start,
+                    time_lookup - start));
+            }
+        }
+        for task in tasks {
+            let task_result = task.await;
+            if let Ok(report) = task_result {
+                reports.push(report);
+            }
+        }
+        reports
+    }
+
+    async fn run_report(&self) -> Vec<ReportDone> {
+        let mut report: Vec<ReportDone> = Vec::new();
+        let mut tasks = vec![];
+        for group in &self.0.config.targets {
+            for host in &group.hostnames {
+                let clone = self.clone();
+                let target_host = host.clone();
+                let target_ports = group.ports.clone();
+                tasks.push( tokio::spawn(async move {
+                    clone.run_report_target_name(target_host, target_ports).await
+                }));
+            }
+        }
+        for task in tasks {
+            let mut batch = task.await.unwrap_or_default();
+            report.append(&mut batch);
+        }
+        report
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn console_subscriber_init(){
+    console_subscriber::init();
+}
+
+#[cfg(not(feature = "tracing"))]
+fn console_subscriber_init(){}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
     env_logger::init();
+    console_subscriber_init();
 
     let config = AckReportConfig::new();
-    let tls_config = config.rustls_client_config();
-    config.set_rayon_env();
+    let ack_runner = AckRunner::new(config);
 
-    let src_hostname = get_hostname();
-    // lookup
-    let local_host_fallback = HostLookup {
-        hostname: src_hostname.clone(),
-        ip: None,
-    };
-
-    let lookup_start = Instant::now();
-    let report_todo: Vec<_> = config.targets
-        .iter()
-        .map(|group| report_hosts_ports(&local_host_fallback, group, config.timeout))
-        .flatten()
-        .collect();
-    let lookup_duration = Instant::now() - lookup_start;
-
-    info!("Found {} target peers in {:?}", report_todo.len(), lookup_duration);  // (RUST_LOG=info for timestamp!)
-    let report_done: Vec<_> = report_todo.into_par_iter().map(|r| r.check_connect(&tls_config)).collect();
+    // info!("Found {} target peers in {:?}", report_todo.len(), lookup_duration);  // (RUST_LOG=info for timestamp!)
+    info!("Starting report");  // (RUST_LOG=info for timestamp!)
+    let report_done = ack_runner.run_report().await;
 
     let any_local_ips = report_done.iter()
         .any(|item| item.has_local_ip());
@@ -729,9 +794,9 @@ fn main() -> io::Result<()> {
     }
     if !any_local_ips
     {
-        local_ip_report(&mut tw, &src_hostname)?;
+        local_ip_report(&mut tw, &ack_runner.0.local_host_fallback.hostname)?;
     }
     tw.flush()?;
-
-    std::process::exit(report_exit_code(&report_done));
+    let exit_code = std::io::Result::Ok(report_exit_code(&report_done))?;
+    std::process::exit(exit_code);
 }

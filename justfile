@@ -11,6 +11,11 @@ local:
 timeout:
     RUST_LOG=info cargo run --release -- --threads 1 --tls --timeout 30ms badssl.com :80 badssl.com :99 no-common-name.badssl.com :443
 
+
+# demo tracing tokio-console run
+console:
+    RUSTFLAGS="--cfg tokio_unstable" cargo run --features tracing -- --timeout 10s --threads 2 www.yahoo.com www.slashdot.org :80 :99 :100 :101 :102 :103 :104 :105 :106 :107 :108 :109 :110
+
 # install into ~/.cargo/bin
 build_install:
     cargo build --release

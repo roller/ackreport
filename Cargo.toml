@@ -1,6 +1,6 @@
 [package]
 name = "ackreport"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["roller@gmail.com"]
 edition = "2018"
 
@@ -14,17 +14,26 @@ log = "0.4"
 env_logger = "0.5.11"
 itertools = "0.8"
 tabwriter = "1.1.0"
-rayon = "1.1.0"
 duration-string = "0.0.6"
 rustls = "0.19"
-webpki = "0.21"
-webpki-roots = "0.21"
-rustls-native-certs = "0.5"
+webpki = "0.22.0"
+webpki-roots = "0.22.2"
+rustls-native-certs = "0.6.1"
+tokio = { version = "1.15.0", features = ["full"] }
+tokio-rustls = "0.23.2"
 
-# This is optional because it doesn't build on windows cross from linux
+# Local IP is optional because it doesn't build on windows cross from linux
 # https://github.com/EstebanBorai/local-ip-address/issues/16
 local-ip-address = { version = "0.4.4", optional = true }
+
+# console-subscriber requires additional env set:
+# eg RUSTFLAGS="--cfg tokio_unstable" cargo build
+# see: https://tokio.rs/blog/2021-12-announcing-tokio-console
+console-subscriber = { version = "0.1.0", optional = true }
 
 [features]
 default = ["local_ip"]
 local_ip = ["local-ip-address"]
+
+# (tracing is experimental)
+tracing = ["tokio/tracing", "console-subscriber"]
