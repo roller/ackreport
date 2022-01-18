@@ -151,6 +151,9 @@ impl std::fmt::Display for TlsResult {
             TlsResult::TlsOk {
                 protocol_version: version
             } => write!(f, "{:?}", version),
+            // default message seems a little redundant, e.g.:
+            // invalid peer certificate contents: invalid peer certificate: UnknownIssuer
+            TlsResult::TlsErr(rustls::Error::InvalidCertificateData(ref data)) => write!(f, "{}", data),
             TlsResult::TlsErr(tls_err) => write!(f, "{}", tls_err),
             _ => write!(f, "{:?}", self),
         }
