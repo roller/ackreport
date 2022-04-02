@@ -29,7 +29,7 @@ impl HostsPortsGroup {
     // group args host1 host2 :22 host3 :33 :44 :55
     // into [{[host1, host2], [22]}, {[host3], [33, 44, 55]}]
     fn group_dest_args(matches: &clap::ArgMatches<'_>) -> Vec<HostsPortsGroup> {
-        let dest_matches = matches.values_of_lossy("dest").unwrap_or_else(Vec::new);
+        let dest_matches = matches.values_of_lossy("dest").unwrap_or_default();
         let mut dest_args = dest_matches.iter();
         let mut dests: Vec<HostsPortsGroup> = vec![];
         loop {
@@ -121,7 +121,7 @@ impl From<io::Error> for TlsResult {
         let kind = error.kind();
         match kind {
             io::ErrorKind::InvalidData => {
-                let tls_error = error.get_ref().map(|r| r.downcast_ref::<rustls::Error>() ).flatten();
+                let tls_error = error.get_ref().and_then(|r| r.downcast_ref::<rustls::Error>());
                 match tls_error {
                     Some(rustls::Error::CorruptMessage) => TlsResult::OpenNoTLS,
                     Some(t) => TlsResult::from(t),
@@ -263,30 +263,31 @@ struct ReportDone {
 }
 
 impl ReportDone {
-    // Q: Should this be a method on ReportDone?
-    fn from_connect_result(pair: ReportConnectionPair, result: ConnectResult,
-                           start: Instant, duration: Duration) -> ReportDone {
-        match &result {
+    fn with_ips(self) -> Self {
+        match &self.result {
             // for open connections, replace initial guesses
             // with actual ips used
             ConnectResult::Open (open_result) => ReportDone {
                 pair: ReportConnectionPair {
                     local: HostLookup {
-                        hostname: pair.local.hostname,
+                        hostname: self.pair.local.hostname,
                         ip: open_result.local.map(|x| x.ip()),
                     },
                     peer: HostLookup {
-                        hostname: pair.peer.hostname,
+                        hostname: self.pair.peer.hostname,
                         ip: open_result.peer.map(|x| x.ip()),
                     },
-                    port: pair.port,
+                    port: self.pair.port,
                 },
-                result,
-                start,
-                duration,
+                .. self
             },
-            _ => ReportDone { pair, result, start, duration },
+            _ => self
         }
+    }
+
+    fn from_connect_result(pair: ReportConnectionPair, result: ConnectResult,
+                           start: Instant, duration: Duration) -> ReportDone {
+        ReportDone { pair, result, start, duration }.with_ips()
     }
 
     fn header<W: Write>(tw: &mut TabWriter<W>) -> io::Result<()> {
@@ -570,7 +571,6 @@ impl AckRunner {
     ) -> ReportDone
     {
         let dns_name = &pair.peer.hostname;
-        // let dns_ref_result = webpki::DnsNameRef::try_from_ascii_str(dns_name);
         let server_name_result = tokio_rustls::rustls::ServerName::try_from(dns_name.as_ref());
         let server_name = match server_name_result {
             Err(invalid_dns) => {
@@ -578,7 +578,7 @@ impl AckRunner {
                 let duration = Instant::now() - start;
                 let result = ConnectResult::Open(open_result);
                 warn!("{}: invalid DNS name {:?}", dns_name, invalid_dns);
-                return ReportDone { pair, result, start, duration };
+                return ReportDone::from_connect_result(pair, result, start, duration);
             }
             Ok(server_name) => server_name
         };
