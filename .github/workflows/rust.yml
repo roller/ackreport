@@ -12,7 +12,9 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
     - uses: actions/checkout@v2
@@ -22,4 +24,7 @@ jobs:
       run: cargo build
     - name: Run tests
       run: cargo test
-  
+    - name: Run bad ssl examples
+      run: cargo run -- --tls badssl.com :80 badssl.com :99 no-common-name.badssl.com wrong.host.badssl.com self-signed.badssl.com revoked.badssl.com 1000-sans.badssl.com ecc384.badssl.com rsa8192.badssl.com mitm-software.badssl.com :443
+    - name: local ip check
+      run: cargo run -- badssl.com :99
