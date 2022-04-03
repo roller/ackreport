@@ -26,8 +26,8 @@ jobs:
     - name: Run workflow commands
       id: cmds
       run: cargo run --release -- --release-workflow-commands x
-    - uses: actions/upload-artifact@v3
+    - uses: softprops/action-gh-release@v1
       with:
         name: ackreport-${{ steps.cmds.outputs.os_name }}-${{ steps.cmds.outputs.version }}
-        path: target/release/ackreport${{ steps.cmds.outputs.exe_suffix }}
-
+        files: target/release/ackreport${{ steps.cmds.outputs.exe_suffix }}
+        body_path: release.txt
