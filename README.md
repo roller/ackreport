@@ -10,7 +10,7 @@ Arguments starting with `:` are interpreted as port numbers.
 For hostnames that return multiple IP addresses, all addresses will be checked.
 
 ```
-ackreport 0.4.0
+ackreport 0.4.1
 
 USAGE:
     ackreport [FLAGS] [OPTIONS] <dest>...

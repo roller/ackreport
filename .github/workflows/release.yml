@@ -27,8 +27,10 @@ jobs:
     - name: Run workflow commands
       id: cmds
       run: cargo run --release -- --release-workflow-commands x
+    - name: Zip release files
+      run: zip "target/ackreport-${{ steps.cmds.outputs.os_name }}-${{ steps.cmds.outputs.version }}.zip" target/release/ackreport${{ steps.cmds.outputs.exe_suffix }}
     - uses: softprops/action-gh-release@v1
       with:
         name: ackreport-${{ steps.cmds.outputs.os_name }}-${{ steps.cmds.outputs.version }}
-        files: target/release/ackreport${{ steps.cmds.outputs.exe_suffix }}
+        files: "target/ackreport-${{ steps.cmds.outputs.os_name }}-${{ steps.cmds.outputs.version }}.zip"
         body_path: release.txt
