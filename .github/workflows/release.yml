@@ -4,8 +4,6 @@ on:
   push:
     tags:
       - v*
-    # Testing build workflow before tagging, TODO: remove
-    branches: [ master ]
 
 env:
   CARGO_TERM_COLOR: always
