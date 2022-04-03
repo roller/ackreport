@@ -403,6 +403,13 @@ impl AckReportConfig {
         let matches = clap::App::new("ackreport")
             .version(VERSION.unwrap_or("v0"))
             .arg(
+                // Integration with github workflows
+                clap::Arg::with_name("release-workflow-commands")
+                    .long("release-workflow-commands")
+                    .hidden(true)
+                    .takes_value(false)
+            )
+            .arg(
                 clap::Arg::with_name("threads")
                     .help("Parallel connection attempts")
                     .multiple(false)
@@ -443,16 +450,24 @@ impl AckReportConfig {
                     .conflicts_with("tls")
             )
             .get_matches();
-            let timeout: Duration =
-                DurationString::from_string(
-                    matches.value_of("timeout")
-                        .expect("timeout has default, this must be present")
-                        .to_string())
-                    .map(|ds| ds.into())
-                    .unwrap_or_else(|e| {
-                        error!("Could not parse timeout arg: {}; using default {:?}", e, default_timeout);
-                        default_timeout
-                    });
+
+        if matches.is_present("release-workflow-commands") {
+            println!("::set-output name=version::{}", VERSION.unwrap_or("v0"));
+            println!("::set-output name=os_name::{}", std::env::consts::OS);
+            println!("::set-output name=arch_name::{}", std::env::consts::ARCH);
+            println!("::set-output name=exe_suffix::{}", std::env::consts::EXE_SUFFIX);
+            std::process::exit(0);
+        }
+        let timeout: Duration =
+            DurationString::from_string(
+                matches.value_of("timeout")
+                    .expect("timeout has default, this must be present")
+                    .to_string())
+                .map(|ds| ds.into())
+                .unwrap_or_else(|e| {
+                    error!("Could not parse timeout arg: {}; using default {:?}", e, default_timeout);
+                    default_timeout
+                });
 
         let tls_mode = if matches.is_present("tls") {
             Some(TlsMode::NativeRoots)
