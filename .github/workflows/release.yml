@@ -28,10 +28,10 @@ jobs:
       run: cargo run --release -- --release-workflow-commands x
     - name: Zip release files (unix)
       run: cd target/release; zip "ackreport-${{ steps.cmds.outputs.os_name }}-${{ steps.cmds.outputs.version }}.zip" ackreport
-      if: steps.cmds.outputs.os_name != "windows"
+      if: steps.cmds.outputs.os_name != 'windows'
     - name: Zip release files (windows)
       run: cd target/release; Compress-Archive -DestinationPath "ackreport-${{ steps.cmds.outputs.os_name }}-${{ steps.cmds.outputs.version }}.zip" -Path ackreport.exe
-      if: steps.cmds.outputs.os_name == "windows"
+      if: steps.cmds.outputs.os_name == 'windows'
     - uses: softprops/action-gh-release@v1
       with:
         name: ackreport ${{ steps.cmds.outputs.version }}
