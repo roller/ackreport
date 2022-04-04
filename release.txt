@@ -1,1 +1,2 @@
-0.4.1 is a very nice release.
+This is a rewrite with higher version number
+and no new features.
