@@ -16,9 +16,12 @@ timeout:
 console:
     RUSTFLAGS="--cfg tokio_unstable" cargo run --features tracing -- --timeout 10s --threads 2 www.yahoo.com www.slashdot.org :80 :99 :100 :101 :102 :103 :104 :105 :106 :107 :108 :109 :110
 
-# install into ~/.cargo/bin
-build_install:
+# build release
+build_release:
     cargo build --release
+
+# install into ~/.cargo/bin
+build_install: build_release
     cp target/release/ackreport ~/.cargo/bin/ackreport
 
 # Overwrite README.md using README.template.md script
@@ -95,5 +98,11 @@ release_bin_wsl:
     strip.exe target/release/ackreport
     cp target/release/ackreport{,-$toolchain-$version}.exe
 
+# create tag based on current version
+tag_release:
+    #!/bin/bash
+    version=$(cargo run --release -- --version | awk '{ print $2 }')
+    git tag v${version}
+
 # update readme and binaries
-release: release_bin_wsl readme
+release: build_release readme
