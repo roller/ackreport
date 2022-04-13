@@ -3,7 +3,7 @@ use std::io;
 use std::io::Write;
 use std::str::FromStr;
 use std::net;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs, IpAddr};
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
@@ -76,7 +76,7 @@ impl HostsPortsGroup {
 #[derive(Clone, Debug)]
 struct HostLookup {
     hostname: String,
-    ip: Option<net::IpAddr>,
+    ip: Option<IpAddr>,
 }
 
 impl std::fmt::Display for HostLookup {
@@ -314,18 +314,40 @@ fn local_ip_line<W: Write>(tw: &mut TabWriter<W>, host_lookup: HostLookup) -> io
     )
 }
 
+fn local_ip_lines<W: Write>(tw: &mut TabWriter<W>, host_ips: Vec<IpAddr>, src_hostname: &str) -> io::Result<()> {
+    for ip in host_ips {
+        local_ip_line(tw, HostLookup {
+            hostname: src_hostname.to_string(),
+            ip: Some(ip),
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "local_ip")]
 fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::Result<()> {
     // No local IPs?  Add ip lookups to the end
     let local_ip = ok_or_log(local_ip(), "Could not get local ip");
-    if let Some(item) = local_ip {
-        // item.println(&mut tw)?;
-        local_ip_line(tw, HostLookup {
-            hostname: src_hostname.to_string(),
-            ip: Some(item),
-        })?;
+    let mut local_ips: Vec<IpAddr> = local_ip.into_iter().collect();
+    if local_ips.is_empty() {
+        local_ips = guess_local_ip_fallback(src_hostname);
     }
-    Ok(())
+    local_ip_lines(tw, local_ips, src_hostname)
+}
+
+fn guess_local_ip_fallback(src_hostname: &str) -> Vec<IpAddr> {
+    let src_addrs = ok_or_log(
+        (src_hostname, 0u16).to_socket_addrs(),
+        "Couldn't lookup local hostname guess");
+    info!("Local lookup: {} found {:?}", src_hostname, src_addrs);
+    if let Some(addrs) = src_addrs {
+        addrs
+            .map(|addr| addr.ip())
+            .filter(|ip| !ip.is_loopback())
+            .collect()
+    } else {
+        vec![]
+    }
 }
 
 // use std to_socket_addrs to attempt
@@ -333,26 +355,8 @@ fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::R
 //  to a loopback address, but has a chance to be better than nothing)
 #[cfg(not(feature = "local_ip"))]
 fn local_ip_report<W: Write>(tw: &mut TabWriter<W>, src_hostname: &str) -> io::Result<()> {
-    let src_addrs = ok_or_log(
-        (src_hostname.clone(), 0u16).to_socket_addrs(),
-        "Couldn't lookup local hostname guess");
-    info!("Local lookup: {} found {:?}", src_hostname, src_addrs);
-    let src_guess = if let Some(addrs) = src_addrs {
-        addrs
-            .map(|addr| addr.ip())
-            .filter(|ip| !ip.is_loopback())
-            .collect()
-    } else {
-        vec![]
-    };
-    for item in &src_guess {
-        // item.println(&mut tw)?;
-        local_ip_line(tw, HostLookup {
-            hostname: src_hostname.to_string(),
-            ip: Some(*item),
-        })?;
-    }
-    Ok(())
+    let src_guess = guess_local_ip_fallback(src_hostname);
+    local_ip_lines(tw, src_guess, src_hostname)
 }
 
 fn get_hostname() -> String {
