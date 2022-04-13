@@ -1,2 +1,2 @@
-This is a rewrite with higher version number
-and no new features.
+ - Add local ip fallback for windows build
+ - Update deps

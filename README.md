@@ -10,7 +10,7 @@ Arguments starting with `:` are interpreted as port numbers.
 For hostnames that return multiple IP addresses, all addresses will be checked.
 
 ```
-ackreport 0.4.5
+ackreport 0.4.6
 
 USAGE:
     ackreport [FLAGS] [OPTIONS] <dest>...
@@ -38,11 +38,11 @@ $ ackreport slashdot.org freshmeat.net :25 :80 :443
 ```
 Local                 Peer                         Port  Time  Result
 abc101                slashdot.org 204.68.111.106  :25   7s    Filtered
-abc101 192.168.1.101  slashdot.org 204.68.111.106  :80   64ms  Open
-abc101 192.168.1.101  slashdot.org 204.68.111.106  :443  64ms  Open
+abc101 192.168.1.101  slashdot.org 204.68.111.106  :80   70ms  Open
+abc101 192.168.1.101  slashdot.org 204.68.111.106  :443  72ms  Open
 abc101                freshmeat.net 216.105.38.10  :25   7s    Filtered
-abc101 192.168.1.101  freshmeat.net 216.105.38.10  :80   70ms  Open
-abc101                freshmeat.net 216.105.38.10  :443  70ms  Closed
+abc101 192.168.1.101  freshmeat.net 216.105.38.10  :80   66ms  Open
+abc101                freshmeat.net 216.105.38.10  :443  66ms  Closed
 ```
 
 ackreport can attempt to negotiate a TLS connection.
@@ -55,16 +55,16 @@ $ ackreport --tls badssl.com :80 badssl.com :99 no-common-name.badssl.com wrong.
 
 ```
 Local                 Peer                                      Port  Time   Result
-abc101 192.168.1.101  badssl.com 104.154.89.105                 :80   50ms   OpenNoTLS
+abc101 192.168.1.101  badssl.com 104.154.89.105                 :80   113ms  OpenNoTLS
 abc101                badssl.com 104.154.89.105                 :99   7s     Filtered
-abc101 192.168.1.101  no-common-name.badssl.com 104.154.89.105  :443  47ms   invalid peer certificate: CertExpired
-abc101 192.168.1.101  wrong.host.badssl.com 104.154.89.105      :443  107ms  invalid peer certificate: CertNotValidForName
-abc101 192.168.1.101  self-signed.badssl.com 104.154.89.105     :443  121ms  invalid peer certificate: UnknownIssuer
-abc101 192.168.1.101  revoked.badssl.com 104.154.89.105         :443  73ms   TLSv1_2
-abc101 192.168.1.101  1000-sans.badssl.com 104.154.89.105       :443  120ms  invalid peer certificate: CertExpired
-abc101 192.168.1.101  ecc384.badssl.com 104.154.89.105          :443  82ms   TLSv1_2
-abc101 192.168.1.101  rsa8192.badssl.com 104.154.89.105         :443  143ms  TLSv1_2
-abc101 192.168.1.101  mitm-software.badssl.com 104.154.89.105   :443  45ms   invalid peer certificate: UnknownIssuer
+abc101 192.168.1.101  no-common-name.badssl.com 104.154.89.105  :443  63ms   invalid peer certificate: CertExpired
+abc101 192.168.1.101  wrong.host.badssl.com 104.154.89.105      :443  58ms   invalid peer certificate: CertNotValidForName
+abc101 192.168.1.101  self-signed.badssl.com 104.154.89.105     :443  107ms  invalid peer certificate: UnknownIssuer
+abc101 192.168.1.101  revoked.badssl.com 104.154.89.105         :443  82ms   TLSv1_2
+abc101 192.168.1.101  1000-sans.badssl.com 104.154.89.105       :443  83ms   invalid peer certificate: CertExpired
+abc101 192.168.1.101  ecc384.badssl.com 104.154.89.105          :443  130ms  TLSv1_2
+abc101 192.168.1.101  rsa8192.badssl.com 104.154.89.105         :443  142ms  TLSv1_2
+abc101 192.168.1.101  mitm-software.badssl.com 104.154.89.105   :443  61ms   invalid peer certificate: UnknownIssuer
 ```
 
 The `--tls` option uses OS certificate roots.
