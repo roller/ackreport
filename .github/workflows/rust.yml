@@ -23,7 +23,7 @@ jobs:
       run: rustup toolchain install stable-x86_64-pc-windows-gnu
       if: matrix.os == 'windows-latest'
     - name: Set windows gnu toolchain as default
-      run: rustup toolchain default stable-x86_64-pc-windows-gnu
+      run: rustup default stable-x86_64-pc-windows-gnu
       if: matrix.os == 'windows-latest'
     - name: Show target list
       run: rustup target list
