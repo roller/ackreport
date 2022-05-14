@@ -17,6 +17,13 @@ jobs:
       
     steps:
     - uses: actions/checkout@v2
+    # build with GNU to avoid MSVCRT140.dll dependency
+    - name: Add windows gnu toolchain
+      run: rustup toolchain install stable-x86_64-pc-windows-gnu
+      if: matrix.os == 'windows-latest'
+    - name: Set windows gnu toolchain as default
+      run: rustup default stable-x86_64-pc-windows-gnu
+      if: matrix.os == 'windows-latest'
     - name: Build
       run: cargo build --release
     - name: Run tests

@@ -1,2 +1,2 @@
- - Add local ip fallback for windows build
+ - Windows build now uses GNU toolchain to avoid MSVCRT140.dll dependency
  - Update deps
