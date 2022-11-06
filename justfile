@@ -106,3 +106,4 @@ tag_release:
 
 # update readme and binaries
 release: build_release readme
+    $EDITOR release.txt

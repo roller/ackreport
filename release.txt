@@ -1,2 +1,1 @@
- - Windows build now uses GNU toolchain to avoid MSVCRT140.dll dependency
  - Update deps
